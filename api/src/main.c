@@ -8,6 +8,7 @@
 #include <MagickWand/MagickWand.h>
 #include <endpoints/article.h>
 #include <endpoints/auth.h>
+#include <endpoints/blocked_email_domain.h>
 #include <endpoints/category.h>
 #include <endpoints/feed.h>
 #include <endpoints/feed_tag.h>
@@ -149,6 +150,17 @@ static void r_users(struct mg_connection *c, struct mg_http_message *msg,
   send_users_res(c, msg, er, secret);
 }
 
+static void r_user_flag(struct mg_connection *c, struct mg_http_message *msg,
+                        struct mg_str *caps, struct error_reply *er,
+                        const char *secret) {
+  int id;
+  if (!mg_str_to_num(caps[0], 10, &id, sizeof(int))) {
+    reply_bad_id(c);
+    return;
+  }
+  send_user_flag_res(c, msg, id, er, secret);
+}
+
 static void r_current_user(struct mg_connection *c, struct mg_http_message *msg,
                            struct mg_str *caps, struct error_reply *er,
                            const char *secret) {
@@ -193,6 +205,27 @@ static void r_tag(struct mg_connection *c, struct mg_http_message *msg,
   }
   send_tag_res(c, msg, name, er, secret);
   free(name);
+}
+
+/* ---- blocked email domain route handlers ---- */
+
+static void r_blocked_domains(struct mg_connection *c,
+                              struct mg_http_message *msg, struct mg_str *caps,
+                              struct error_reply *er, const char *secret) {
+  (void)caps;
+  send_blocked_email_domains_res(c, msg, er, secret);
+}
+
+static void r_blocked_domain(struct mg_connection *c,
+                             struct mg_http_message *msg, struct mg_str *caps,
+                             struct error_reply *er, const char *secret) {
+  char *domain = decode_name(caps[0]);
+  if (!domain) {
+    reply_bad_name(c);
+    return;
+  }
+  send_blocked_email_domain_res(c, msg, domain, er, secret);
+  free(domain);
 }
 
 /* ---- feed route handlers ---- */
@@ -583,6 +616,7 @@ static const struct route_entry routes[] = {
     {"issue", r_issues, 0, 0},
     /* remaining resources */
     {"user/current", r_current_user, 0, 0},
+    {"user/*/flag", r_user_flag, 0, 0},
     {"user/count", r_user_count, 0, 0},
     {"user/*", r_user, 0, 0},
     {"user", r_users, 0, 0},
@@ -596,6 +630,8 @@ static const struct route_entry routes[] = {
     {"feed", r_feeds, 0, 0, "public, max-age=300, stale-while-revalidate=60"},
     {"sponsor/*", r_sponsor, 0, 0},
     {"sponsor", r_sponsors, 0, 0},
+    {"blocked-domain/*", r_blocked_domain, 0, 0},
+    {"blocked-domain", r_blocked_domains, 0, 0},
     {"media/*", r_media, 0, 0, "public, max-age=86400, immutable"},
     {"media", r_medias, 0, 0, "public, max-age=300"},
     {"view", r_views, 0, 0},

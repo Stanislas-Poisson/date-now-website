@@ -18,12 +18,14 @@ int user_exists(int id);
 
 /**
  * @brief Checks whether a user with the given username or email already exists.
- * @param username Username to check (may be NULL to skip).
- * @param email    Email to check (may be NULL to skip).
+ * @param username   Username to check (may be NULL to skip).
+ * @param email      Email to check (may be NULL to skip).
+ * @param exclude_id User id to exclude from the check (pass -1 to check
+ *                    against all users, e.g. on creation).
  * @return 1 if a conflicting record exists, 0 if not, negative on SQL error.
  * @note Neither @p username nor @p email is freed by this function.
  */
-int user_identity_exists(char *username, char *email);
+int user_identity_exists(char *username, char *email, int exclude_id);
 
 /**
  * @brief Returns the total number of users matching an optional search query.
@@ -100,6 +102,30 @@ int add_user(struct user *user);
 int edit_user(struct user *user);
 
 /**
+ * @brief Flags or unflags the email of a user, by hand.
+ * @param id      Database identifier.
+ * @param flagged 1 to flag, 0 to remove the flag.
+ * @param reason  Reason of the flag, used when @p flagged is 1 (may be NULL).
+ * @return 0 on success, HTTP_NOT_FOUND if there is no such user,
+ *         HTTP_INTERNAL_ERROR on SQL error.
+ * @note @p reason is not freed by this function.
+ */
+int set_user_email_flag(int id, int flagged, const char *reason);
+
+/**
+ * @brief Sets the flag that comes from the admission of a new email: the
+ *        reason is "blocked_domain" when @p flagged is 1.
+ * @param id      Database identifier.
+ * @param flagged 1 if the email domain is blocked, 0 otherwise.
+ * @param user    Structure of the same user, updated with the new flag (may be
+ *                NULL).
+ * @return 0 on success, HTTP_INTERNAL_ERROR on SQL error.
+ * @note A flag that an author set by hand, with another reason, is left as it
+ *       is.
+ */
+int refresh_user_email_flag(int id, int flagged, struct user *user);
+
+/**
  * @brief Deletes a user by id.
  * @param id Database identifier.
  * @return 0 on success, http_res_code on error.
@@ -107,24 +133,20 @@ int edit_user(struct user *user);
 int delete_user(int id);
 
 /**
- * @brief Fetches the email addresses of all newsletter subscribers.
- *
- * Only returns subscribers that are NOT email-flagged (isEmailFlagged = 0),
- * protecting the newsletter sender reputation.
- *
+ * @brief Returns the total number of users, optionally filtered by type.
+ * @param type Optional filter: "subscriber" (subscribedAt IS NOT NULL) or
+ *             "author" (role = 'AUTHOR'). NULL = no filter.
+ * @return Count of matching users, or a negative http_res_code on error.
+ * @note @p type is not freed by this function.
+ */
+int get_users_count(const char *type);
+
+/**
+ * @brief Fetches the email addresses of all newsletter subscribers whose
+ *        email is not flagged.
  * @param len    Output: number of addresses returned.
  * @param emails Output: dynamically allocated array of NUL-terminated strings.
  *               The array and each string must be freed by the caller.
  * @return 0 on success, http_res_code on error.
  */
 int get_subscriber_emails(size_t *len, char ***emails);
-
-/**
- * @brief Updates the email-flag status of a user.
- * @param id      User database identifier.
- * @param flagged 1 to flag the user, 0 to clear the flag.
- * @param reason  Reason string ("blocked_domain", "manual_override", or NULL
- *                to clear). Not freed by this function.
- * @return 0 on success, SQLITE_* error code on failure.
- */
-int set_user_email_flag(int id, int flagged, const char *reason);

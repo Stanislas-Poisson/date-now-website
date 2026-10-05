@@ -17,6 +17,13 @@
 int issue_exists(int id);
 
 /**
+ * @brief Checks whether an issue with the given slug exists.
+ * @param slug URL-friendly identifier. Not freed by this function.
+ * @return 1 if the issue exists, 0 if not, negative on SQL error.
+ */
+int issue_slug_exists(char *slug);
+
+/**
  * @brief Checks whether an issue with the same title, number, or slug exists.
  * @param title        Title to check.
  * @param issue_number Issue number to check.
@@ -24,7 +31,16 @@ int issue_exists(int id);
  * @return 1 if a conflicting record exists, 0 if not, negative on SQL error.
  * @note None of the pointer parameters are freed by this function.
  */
-int issue_identity_exists(char *title, int issue_number, char *slug);
+int issue_identity_exists(char *title, int issue_number, char *slug, int id);
+
+/**
+ * @brief Returns the total number of issues, optionally filtered by status.
+ * @param status Optional status filter: "DRAFT", "PUBLISHED", or "ARCHIVE"
+ *               (NULL = no filter).
+ * @return Count of matching issues, or a negative http_res_code on error.
+ * @note @p status is not freed by this function.
+ */
+int get_issues_count(const char *status);
 
 /**
  * @brief Returns the total number of issues matching an optional query and
@@ -56,7 +72,8 @@ int get_issues(size_t len, struct issue **arr, const struct mg_str *q,
                int page_size);
 
 /**
- * @brief Fetches a single issue by id, including its tags, authors, and sponsors.
+ * @brief Fetches a single issue by id, including its tags, authors, and
+ * sponsors.
  * @param issue Pre-allocated and initialised structure to fill.
  * @param id    Database identifier.
  * @return 0 on success, HTTP_NOT_FOUND if not found, HTTP_INTERNAL_ERROR on
@@ -65,6 +82,19 @@ int get_issues(size_t len, struct issue **arr, const struct mg_str *q,
  *       must be freed via free_issue().
  */
 int get_issue(struct issue *issue, int id);
+
+/**
+ * @brief Fetches a single issue by slug, including its tags, authors, and
+ * sponsors.
+ * @param issue Pre-allocated and initialised structure to fill.
+ * @param slug  URL-friendly identifier to look up.
+ * @return 0 on success, HTTP_NOT_FOUND if not found, HTTP_INTERNAL_ERROR on
+ *         SQL error.
+ * @note @p slug is not freed by this function. Dynamic fields (including
+ *       nested sub-structures) are allocated and must be freed via
+ *       free_issue().
+ */
+int get_issue_by_slug(struct issue *issue, char *slug);
 
 /**
  * @brief Inserts a new issue record.

@@ -6,46 +6,50 @@
  */
 
 #include <cjson/cJSON.h>
-#include <lib/email_validator.h>
 #include <lib/mongoose.h>
+#include <lib/crypto.h>
+#include <lib/pg.h>
+#include <lib/validatejson.h>
 #include <macros/colors.h>
 #include <macros/utils.h>
 #include <regex.h>
-#include <sqlite3.h>
-#include <sql/blocked_email_domain.h>
+#include <sql/media.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <structs.h>
 #include <utils.h>
 
 #define METHODS_LEN 4
 
-#define MAP_DOUBLE(dest, stmt, index, required)                                \
-  if (sqlite3_column_type(stmt, index) == SQLITE_FLOAT) {                      \
-    double d = sqlite3_column_double(stmt, index);                             \
-    printf("%s: %f, ", sqlite3_column_name(stmt, index), d);                   \
+/* Postgres row-fetch macros: `row` is a `pg_row_t *` (result set + row
+ * index), `index` is the 0-based column index. Values are always returned
+ * as text by libpq (unless binary format is requested, which we don't use)
+ * — parsed here into the destination's C type. */
+
+#define MAP_DOUBLE(dest, row, index, required)                                 \
+  if (!PQgetisnull((row)->res, (row)->row, index)) {                           \
+    double d = atof(PQgetvalue((row)->res, (row)->row, index));                \
+    printf("%s: %f, ", PQfname((row)->res, index), d);                         \
     dest = d;                                                                  \
   } else if (required) {                                                       \
     return 1;                                                                  \
   }
 
-#define MAP_TEXT(dest, stmt, index, required)                                  \
-  if (sqlite3_column_type(stmt, index) == SQLITE_TEXT) {                       \
-    const char *str = (const char *)sqlite3_column_text(stmt, index);          \
-    printf("%s: %s, ", sqlite3_column_name(stmt, index), str);                 \
+#define MAP_TEXT(dest, row, index, required)                                   \
+  if (!PQgetisnull((row)->res, (row)->row, index)) {                           \
+    const char *str = PQgetvalue((row)->res, (row)->row, index);               \
+    printf("%s: %s, ", PQfname((row)->res, index), str);                       \
     dest = strndup(str, strlen(str));                                          \
   } else if (required) {                                                       \
     return 1;                                                                  \
   }
 
-#define MAP_INT(dest, stmt, index, required)                                   \
-  printf("type int:  %d, ", sqlite3_column_type(stmt, index));                 \
-  if (sqlite3_column_type(stmt, index) == SQLITE_INTEGER) {                    \
-    int integer = sqlite3_column_int(stmt, index);                             \
-    printf("%s: %d, ", sqlite3_column_name(stmt, index), integer);             \
+#define MAP_INT(dest, row, index, required)                                    \
+  if (!PQgetisnull((row)->res, (row)->row, index)) {                           \
+    int integer = atoi(PQgetvalue((row)->res, (row)->row, index));             \
+    printf("%s: %d, \n", PQfname((row)->res, index), integer);                 \
     dest = integer;                                                            \
   } else if (required) {                                                       \
     return 1;                                                                  \
@@ -53,6 +57,20 @@
     dest = 0;                                                                  \
   }
 
+/* Postgres BOOLEAN columns come back from PQgetvalue() as the literal text
+ * "t"/"f" — not "1"/"0" — so they need their own macro rather than
+ * MAP_INT. (Binding *out* to a BOOLEAN column still accepts "1"/"0" text,
+ * so no equivalent write-side macro is needed.) */
+#define MAP_BOOL(dest, row, index, required)                                   \
+  if (!PQgetisnull((row)->res, (row)->row, index)) {                           \
+    const char *b = PQgetvalue((row)->res, (row)->row, index);                 \
+    printf("%s: %s, \n", PQfname((row)->res, index), b);                       \
+    dest = (b[0] == 't');                                                      \
+  } else if (required) {                                                       \
+    return 1;                                                                  \
+  } else {                                                                     \
+    dest = 0;                                                                  \
+  }
 
 static void trim(char *str) {
   int len = strlen(str);
@@ -105,69 +123,6 @@ int check_email_validity(char *email) {
   }
 
   regfree(&regex);
-  return 0;
-}
-
-int email_admission_inspect(const char *email,
-                            struct email_admission_result *result) {
-  if (result == NULL) return -1;
-
-  result->allowed     = 1;
-  result->is_flagged  = 0;
-  result->reason_code = EMAIL_ADMISSION_OK;
-
-  // Bypass env var - skip all validation
-  const char *bypass = getenv("EMAIL_VALIDATION_BYPASS");
-  if (bypass != NULL && bypass[0] == '1') {
-    return 0;
-  }
-
-  // Extract and lowercase domain
-  char domain[256];
-  if (email_domain_normalize(email, domain, sizeof(domain)) != 0) {
-    result->allowed     = 0;
-    result->reason_code = EMAIL_ADMISSION_DNS_FAIL;
-    return 0;
-  }
-
-  // Reject the service's own domain
-  const char *app_domain = getenv("APP_DOMAIN");
-  if (app_domain != NULL && *app_domain != '\0') {
-    if (strcasecmp(domain, app_domain) == 0) {
-      result->allowed     = 0;
-      result->reason_code = EMAIL_ADMISSION_APP_DOMAIN;
-      return 0;
-    }
-  }
-
-  // DNS check
-  if (!email_dns_can_receive(domain)) {
-    result->allowed     = 0;
-    result->reason_code = EMAIL_ADMISSION_DNS_FAIL;
-    return 0;
-  }
-
-  // Blocked domain check
-  int blocked = blocked_domain_exists(domain);
-  if (blocked < 0) {
-    // SQL error - treat as reject
-    result->allowed     = 0;
-    result->reason_code = EMAIL_ADMISSION_BLOCKED;
-    return blocked;
-  }
-  if (blocked > 0) {
-    const char *mode = getenv("EMAIL_BLOCKLIST_MODE");
-    if (mode != NULL && strcmp(mode, "flag") == 0) {
-      // Flag mode: accept but mark the user
-      result->is_flagged  = 1;
-      result->reason_code = EMAIL_ADMISSION_BLOCKED;
-    } else {
-      // Reject mode (default)
-      result->allowed     = 0;
-      result->reason_code = EMAIL_ADMISSION_BLOCKED;
-    }
-  }
-
   return 0;
 }
 
@@ -235,18 +190,30 @@ void list_reply_to_json(struct list_reply *reply) {
 }
 
 static cJSON *media_to_cjson(struct media *media) {
-  if (media == NULL) return cJSON_CreateNull();
+  if (media == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddNumberToObject(obj, "id", media->id);
-  cJSON_AddStringToObject(obj, "alt", media->alternative_text);
-  cJSON_AddStringToObject(obj, "url", media->url);
+  if (media->alternative_text != NULL)
+    cJSON_AddStringToObject(obj, "alt", media->alternative_text);
+  else
+    cJSON_AddNullToObject(obj, "alt");
+  if (media->url != NULL)
+    cJSON_AddStringToObject(obj, "url", media->url);
+  else
+    cJSON_AddNullToObject(obj, "url");
+  if (media->thumb_url != NULL)
+    cJSON_AddStringToObject(obj, "thumbUrl", media->thumb_url);
+  else
+    cJSON_AddNullToObject(obj, "thumbUrl");
   cJSON_AddNumberToObject(obj, "width", media->width);
   cJSON_AddNumberToObject(obj, "height", media->height);
   return obj;
 }
 
 char *media_to_json(struct media *media) {
-  if (media == NULL) return "null";
+  if (media == NULL)
+    return "null";
   cJSON *obj = media_to_cjson(media);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -254,7 +221,8 @@ char *media_to_json(struct media *media) {
 }
 
 char *medias_to_json(struct media **medias, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, media_to_cjson(medias[i]));
@@ -264,7 +232,8 @@ char *medias_to_json(struct media **medias, size_t len) {
 }
 
 static cJSON *user_to_cjson(struct user *user) {
-  if (user == NULL) return cJSON_CreateNull();
+  if (user == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddNumberToObject(obj, "id", user->id);
   if (user->username != NULL)
@@ -279,8 +248,12 @@ static cJSON *user_to_cjson(struct user *user) {
     cJSON_AddNullToObject(obj, "link");
   cJSON_AddItemToObject(obj, "picture", media_to_cjson(user->picture));
   cJSON_AddNumberToObject(obj, "subscribedAt", user->subscribed_at);
-  cJSON_AddNumberToObject(obj, "isSupporter", user->is_supporter);
+
+  cJSON_AddItemToObject(obj, "isSupporter",
+                        cJSON_CreateBool(user->is_supporter));
   cJSON_AddNumberToObject(obj, "createdAt", user->created_at);
+  cJSON_AddNumberToObject(obj, "trackerPixelConsentDate",
+                          user->tracker_pixel_consent_date);
   cJSON_AddNumberToObject(obj, "isEmailFlagged", user->is_email_flagged);
   if (user->email_flag_reason != NULL)
     cJSON_AddStringToObject(obj, "emailFlagReason", user->email_flag_reason);
@@ -290,7 +263,8 @@ static cJSON *user_to_cjson(struct user *user) {
 }
 
 char *user_to_json(struct user *user) {
-  if (user == NULL) return "null";
+  if (user == NULL)
+    return "null";
   cJSON *obj = user_to_cjson(user);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -298,7 +272,8 @@ char *user_to_json(struct user *user) {
 }
 
 char *users_to_json(struct user **users, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, user_to_cjson(users[i]));
@@ -308,7 +283,8 @@ char *users_to_json(struct user **users, size_t len) {
 }
 
 static cJSON *view_to_cjson(struct view *view) {
-  if (view == NULL) return cJSON_CreateNull();
+  if (view == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddNumberToObject(obj, "id", view->id);
   cJSON_AddNumberToObject(obj, "time", view->time);
@@ -318,7 +294,8 @@ static cJSON *view_to_cjson(struct view *view) {
 }
 
 char *view_to_json(struct view *view) {
-  if (view == NULL) return "null";
+  if (view == NULL)
+    return "null";
   cJSON *obj = view_to_cjson(view);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -326,7 +303,8 @@ char *view_to_json(struct view *view) {
 }
 
 char *views_to_json(struct view **views, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, view_to_cjson(views[i]));
@@ -336,7 +314,8 @@ char *views_to_json(struct view **views, size_t len) {
 }
 
 static cJSON *tag_to_cjson(struct tag *tag) {
-  if (tag == NULL) return cJSON_CreateNull();
+  if (tag == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddStringToObject(obj, "name", tag->name);
   cJSON_AddStringToObject(obj, "color", tag->color);
@@ -344,7 +323,8 @@ static cJSON *tag_to_cjson(struct tag *tag) {
 }
 
 char *tag_to_json(struct tag *tag) {
-  if (tag == NULL) return "null";
+  if (tag == NULL)
+    return "null";
   cJSON *obj = tag_to_cjson(tag);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -352,7 +332,8 @@ char *tag_to_json(struct tag *tag) {
 }
 
 char *tags_to_json(struct tag **tags, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, tag_to_cjson(tags[i]));
@@ -361,8 +342,175 @@ char *tags_to_json(struct tag **tags, size_t len) {
   return json;
 }
 
+static cJSON *feed_to_cjson(struct feed *feed) {
+  if (feed == NULL)
+    return cJSON_CreateNull();
+  cJSON *obj = cJSON_CreateObject();
+  cJSON_AddNumberToObject(obj, "id", feed->id);
+  cJSON_AddStringToObject(obj, "name", feed->name);
+  cJSON_AddStringToObject(obj, "link", feed->link);
+  cJSON_AddItemToObject(obj, "isRssFeed", cJSON_CreateBool(feed->is_rss_feed));
+  return obj;
+}
+
+char *feed_to_json(struct feed *feed) {
+  if (feed == NULL)
+    return "null";
+  cJSON *obj = feed_to_cjson(feed);
+  char *json = cJSON_PrintUnformatted(obj);
+  cJSON_Delete(obj);
+  return json;
+}
+
+char *feeds_to_json(struct feed **feeds, size_t len) {
+  if (len == 0)
+    return "[]";
+  cJSON *arr = cJSON_CreateArray();
+  for (size_t i = 0; i < len; i++)
+    cJSON_AddItemToArray(arr, feed_to_cjson(feeds[i]));
+  char *json = cJSON_PrintUnformatted(arr);
+  cJSON_Delete(arr);
+  return json;
+}
+
+static cJSON *feed_tag_to_cjson(struct feed_tag *ft) {
+  if (ft == NULL)
+    return cJSON_CreateNull();
+  cJSON *obj = cJSON_CreateObject();
+  cJSON_AddNumberToObject(obj, "feedId", ft->feed_id);
+  cJSON_AddStringToObject(obj, "tagName", ft->tag_name);
+  return obj;
+}
+
+char *feed_tag_to_json(struct feed_tag *feed_tag) {
+  if (feed_tag == NULL)
+    return "null";
+  cJSON *obj = feed_tag_to_cjson(feed_tag);
+  char *json = cJSON_PrintUnformatted(obj);
+  cJSON_Delete(obj);
+  return json;
+}
+
+char *feed_tags_to_json(struct feed_tag **feed_tags, size_t len) {
+  if (len == 0)
+    return "[]";
+  cJSON *arr = cJSON_CreateArray();
+  for (size_t i = 0; i < len; i++)
+    cJSON_AddItemToArray(arr, feed_tag_to_cjson(feed_tags[i]));
+  char *json = cJSON_PrintUnformatted(arr);
+  cJSON_Delete(arr);
+  return json;
+}
+
+static cJSON *category_to_cjson(struct category *category) {
+  if (category == NULL)
+    return cJSON_CreateNull();
+  cJSON *obj = cJSON_CreateObject();
+  cJSON_AddStringToObject(obj, "name", category->name);
+  cJSON_AddStringToObject(obj, "color", category->color);
+  return obj;
+}
+
+char *category_to_json(struct category *category) {
+  if (category == NULL)
+    return "null";
+  cJSON *obj = category_to_cjson(category);
+  char *json = cJSON_PrintUnformatted(obj);
+  cJSON_Delete(obj);
+  return json;
+}
+
+char *categories_to_json(struct category **categories, size_t len) {
+  if (len == 0)
+    return "[]";
+  cJSON *arr = cJSON_CreateArray();
+  for (size_t i = 0; i < len; i++)
+    cJSON_AddItemToArray(arr, category_to_cjson(categories[i]));
+  char *json = cJSON_PrintUnformatted(arr);
+  cJSON_Delete(arr);
+  return json;
+}
+
+static cJSON *article_to_cjson(struct article *article) {
+  if (article == NULL)
+    return cJSON_CreateNull();
+  cJSON *obj = cJSON_CreateObject();
+  cJSON_AddNumberToObject(obj, "id", article->id);
+  cJSON_AddNumberToObject(obj, "sectionId", article->section_id);
+  cJSON_AddNumberToObject(obj, "position", article->position);
+  cJSON_AddStringToObject(obj, "title", article->title);
+  cJSON_AddStringToObject(obj, "sourceName", article->source_name);
+  cJSON_AddStringToObject(obj, "sourceUrl", article->source_url);
+  cJSON_AddStringToObject(obj, "summary", article->summary);
+  return obj;
+}
+
+char *article_to_json(struct article *article) {
+  if (article == NULL)
+    return "null";
+  cJSON *obj = article_to_cjson(article);
+  char *json = cJSON_PrintUnformatted(obj);
+  cJSON_Delete(obj);
+  return json;
+}
+
+char *articles_to_json(struct article **articles, size_t len) {
+  if (len == 0)
+    return "[]";
+  cJSON *arr = cJSON_CreateArray();
+  for (size_t i = 0; i < len; i++)
+    cJSON_AddItemToArray(arr, article_to_cjson(articles[i]));
+  char *json = cJSON_PrintUnformatted(arr);
+  cJSON_Delete(arr);
+  return json;
+}
+
+static cJSON *issue_section_to_cjson(struct issue_section *section) {
+  if (section == NULL)
+    return cJSON_CreateNull();
+  cJSON *obj = cJSON_CreateObject();
+  cJSON_AddNumberToObject(obj, "id", section->id);
+  cJSON_AddNumberToObject(obj, "issueId", section->issue_id);
+  cJSON_AddNumberToObject(obj, "position", section->position);
+  cJSON_AddStringToObject(obj, "type", section->type);
+  if (section->category_name != NULL)
+    cJSON_AddStringToObject(obj, "categoryName", section->category_name);
+  else
+    cJSON_AddNullToObject(obj, "categoryName");
+  if (section->text_body != NULL)
+    cJSON_AddStringToObject(obj, "textBody", section->text_body);
+  else
+    cJSON_AddNullToObject(obj, "textBody");
+  cJSON *articles_arr = cJSON_CreateArray();
+  for (size_t i = 0; i < section->articles_count; i++)
+    cJSON_AddItemToArray(articles_arr, article_to_cjson(section->articles[i]));
+  cJSON_AddItemToObject(obj, "articles", articles_arr);
+  return obj;
+}
+
+char *issue_section_to_json(struct issue_section *section) {
+  if (section == NULL)
+    return "null";
+  cJSON *obj = issue_section_to_cjson(section);
+  char *json = cJSON_PrintUnformatted(obj);
+  cJSON_Delete(obj);
+  return json;
+}
+
+char *issue_sections_to_json(struct issue_section **sections, size_t len) {
+  if (len == 0)
+    return "[]";
+  cJSON *arr = cJSON_CreateArray();
+  for (size_t i = 0; i < len; i++)
+    cJSON_AddItemToArray(arr, issue_section_to_cjson(sections[i]));
+  char *json = cJSON_PrintUnformatted(arr);
+  cJSON_Delete(arr);
+  return json;
+}
+
 static cJSON *sponsor_to_cjson(struct sponsor *sponsor) {
-  if (sponsor == NULL) return cJSON_CreateNull();
+  if (sponsor == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddStringToObject(obj, "name", sponsor->name);
   cJSON_AddStringToObject(obj, "link", sponsor->link);
@@ -370,7 +518,8 @@ static cJSON *sponsor_to_cjson(struct sponsor *sponsor) {
 }
 
 char *sponsor_to_json(struct sponsor *sponsor) {
-  if (sponsor == NULL) return "null";
+  if (sponsor == NULL)
+    return "null";
   cJSON *obj = sponsor_to_cjson(sponsor);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -378,7 +527,8 @@ char *sponsor_to_json(struct sponsor *sponsor) {
 }
 
 char *sponsors_to_json(struct sponsor **sponsors, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, sponsor_to_cjson(sponsors[i]));
@@ -388,7 +538,8 @@ char *sponsors_to_json(struct sponsor **sponsors, size_t len) {
 }
 
 static cJSON *issue_tag_to_cjson(struct issue_tag *it) {
-  if (it == NULL) return cJSON_CreateNull();
+  if (it == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddStringToObject(obj, "tagName", it->tag_name);
   cJSON_AddNumberToObject(obj, "issueId", it->issue_id);
@@ -396,7 +547,8 @@ static cJSON *issue_tag_to_cjson(struct issue_tag *it) {
 }
 
 char *issue_tag_to_json(struct issue_tag *it) {
-  if (it == NULL) return "null";
+  if (it == NULL)
+    return "null";
   cJSON *obj = issue_tag_to_cjson(it);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -404,7 +556,8 @@ char *issue_tag_to_json(struct issue_tag *it) {
 }
 
 char *issue_tags_to_json(struct issue_tag **its, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, issue_tag_to_cjson(its[i]));
@@ -414,7 +567,8 @@ char *issue_tags_to_json(struct issue_tag **its, size_t len) {
 }
 
 static cJSON *issue_author_to_cjson(struct issue_author *ia) {
-  if (ia == NULL) return cJSON_CreateNull();
+  if (ia == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddNumberToObject(obj, "userId", ia->user_id);
   cJSON_AddNumberToObject(obj, "issueId", ia->issue_id);
@@ -422,7 +576,8 @@ static cJSON *issue_author_to_cjson(struct issue_author *ia) {
 }
 
 char *issue_author_to_json(struct issue_author *ia) {
-  if (ia == NULL) return "null";
+  if (ia == NULL)
+    return "null";
   cJSON *obj = issue_author_to_cjson(ia);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -430,7 +585,8 @@ char *issue_author_to_json(struct issue_author *ia) {
 }
 
 char *issue_authors_to_json(struct issue_author **ias, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, issue_author_to_cjson(ias[i]));
@@ -440,16 +596,19 @@ char *issue_authors_to_json(struct issue_author **ias, size_t len) {
 }
 
 static cJSON *issue_sponsor_to_cjson(struct issue_sponsor *is) {
-  if (is == NULL) return cJSON_CreateNull();
+  if (is == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddStringToObject(obj, "sponsorName", is->sponsor_name);
   cJSON_AddNumberToObject(obj, "issueId", is->issue_id);
+  cJSON_AddStringToObject(obj, "issueLink", is->issue_link);
   cJSON_AddStringToObject(obj, "link", is->link);
   return obj;
 }
 
 char *issue_sponsor_to_json(struct issue_sponsor *is) {
-  if (is == NULL) return "null";
+  if (is == NULL)
+    return "null";
   cJSON *obj = issue_sponsor_to_cjson(is);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -457,7 +616,8 @@ char *issue_sponsor_to_json(struct issue_sponsor *is) {
 }
 
 char *issue_sponsors_to_json(struct issue_sponsor **iss, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, issue_sponsor_to_cjson(iss[i]));
@@ -467,7 +627,8 @@ char *issue_sponsors_to_json(struct issue_sponsor **iss, size_t len) {
 }
 
 static cJSON *issue_to_cjson(struct issue *issue) {
-  if (issue == NULL) return cJSON_CreateNull();
+  if (issue == NULL)
+    return cJSON_CreateNull();
   cJSON *obj = cJSON_CreateObject();
   cJSON_AddNumberToObject(obj, "id", issue->id);
   cJSON_AddStringToObject(obj, "slug", issue->slug);
@@ -478,15 +639,18 @@ static cJSON *issue_to_cjson(struct issue *issue) {
   cJSON_AddNumberToObject(obj, "publishedAt", issue->published_at);
   cJSON_AddNumberToObject(obj, "updatedAt", issue->updated_at);
   cJSON_AddNumberToObject(obj, "issueNumber", issue->issue_number);
+  cJSON_AddNumberToObject(obj, "views", issue->views);
   cJSON_AddStringToObject(obj, "excerpt", issue->excerpt);
-  cJSON_AddStringToObject(obj, "content", issue->content);
-  cJSON_AddNumberToObject(obj, "isSponsored", issue->is_sponsored);
+  cJSON_AddItemToObject(obj, "isSponsored",
+                        cJSON_CreateBool(issue->is_sponsored));
   cJSON_AddStringToObject(obj, "status", issue->status);
   cJSON_AddNumberToObject(obj, "openedMailCount", issue->opened_mail_count);
+  if (issue->vod_url != NULL)
+    cJSON_AddStringToObject(obj, "vodUrl", issue->vod_url);
 
   cJSON *tags_arr = cJSON_CreateArray();
   for (size_t i = 0; i < issue->tags_count; i++)
-    cJSON_AddItemToArray(tags_arr, issue_tag_to_cjson(issue->tags[i]));
+    cJSON_AddItemToArray(tags_arr, tag_to_cjson(issue->tags[i]));
   cJSON_AddItemToObject(obj, "tags", tags_arr);
 
   cJSON *authors_arr = cJSON_CreateArray();
@@ -496,14 +660,22 @@ static cJSON *issue_to_cjson(struct issue *issue) {
 
   cJSON *sponsors_arr = cJSON_CreateArray();
   for (size_t i = 0; i < issue->sponsors_count; i++)
-    cJSON_AddItemToArray(sponsors_arr, issue_sponsor_to_cjson(issue->sponsors[i]));
+    cJSON_AddItemToArray(sponsors_arr,
+                         issue_sponsor_to_cjson(issue->sponsors[i]));
   cJSON_AddItemToObject(obj, "sponsors", sponsors_arr);
+
+  cJSON *sections_arr = cJSON_CreateArray();
+  for (size_t i = 0; i < issue->sections_count; i++)
+    cJSON_AddItemToArray(sections_arr,
+                         issue_section_to_cjson(issue->sections[i]));
+  cJSON_AddItemToObject(obj, "sections", sections_arr);
 
   return obj;
 }
 
 char *issue_to_json(struct issue *issue) {
-  if (issue == NULL) return "null";
+  if (issue == NULL)
+    return "null";
   cJSON *obj = issue_to_cjson(issue);
   char *json = cJSON_PrintUnformatted(obj);
   cJSON_Delete(obj);
@@ -511,7 +683,8 @@ char *issue_to_json(struct issue *issue) {
 }
 
 char *issues_to_json(struct issue **issues, size_t len) {
-  if (len == 0) return "[]";
+  if (len == 0)
+    return "[]";
   cJSON *arr = cJSON_CreateArray();
   for (size_t i = 0; i < len; i++)
     cJSON_AddItemToArray(arr, issue_to_cjson(issues[i]));
@@ -525,9 +698,11 @@ char *issues_to_json(struct issue **issues, size_t len) {
 int free_media(struct media *media) {
   free(media->alternative_text);
   free(media->url);
+  free(media->thumb_url);
 
   media->alternative_text = NULL;
   media->url = NULL;
+  media->thumb_url = NULL;
 
   free(media);
   media = NULL;
@@ -540,16 +715,18 @@ int free_user(struct user *user) {
   free(user->email);
   free(user->role);
   free(user->link);
+  free(user->totp_seed);
   free(user->email_flag_reason);
 
   if (user->picture != NULL) {
     free_media(user->picture);
   }
 
-  user->username          = NULL;
-  user->email             = NULL;
-  user->role              = NULL;
-  user->link              = NULL;
+  user->username = NULL;
+  user->email = NULL;
+  user->role = NULL;
+  user->link = NULL;
+  user->totp_seed = NULL;
   user->email_flag_reason = NULL;
 
   free(user);
@@ -574,15 +751,15 @@ int free_issue(struct issue *issue) {
   free(issue->title);
   free(issue->subtitle);
   free(issue->excerpt);
-  free(issue->content);
   free(issue->status);
+  free(issue->vod_url);
 
   if (issue->cover != NULL) {
     free_media(issue->cover);
   }
 
   if (issue->tags != NULL) {
-    free_issue_tags(issue->tags, issue->tags_count);
+    free_tags(issue->tags, issue->tags_count);
   }
   if (issue->authors != NULL) {
     free_users(issue->authors, issue->authors_count);
@@ -590,13 +767,16 @@ int free_issue(struct issue *issue) {
   if (issue->sponsors != NULL) {
     free_issue_sponsors(issue->sponsors, issue->sponsors_count);
   }
+  if (issue->sections != NULL) {
+    free_issue_sections(issue->sections, issue->sections_count);
+  }
 
   issue->slug = NULL;
   issue->title = NULL;
   issue->subtitle = NULL;
   issue->excerpt = NULL;
-  issue->content = NULL;
   issue->status = NULL;
+  issue->vod_url = NULL;
 
   free(issue);
   issue = NULL;
@@ -612,8 +792,10 @@ int free_issue_author(struct issue_author *issue) {
 }
 int free_issue_sponsor(struct issue_sponsor *issue) {
   free(issue->sponsor_name);
+  free(issue->issue_link);
   free(issue->link);
   issue->sponsor_name = NULL;
+  issue->issue_link = NULL;
   issue->link = NULL;
 
   free(issue);
@@ -631,6 +813,29 @@ int free_issue_tag(struct issue_tag *issue) {
   return 0;
 }
 
+int free_feed(struct feed *feed) {
+  free(feed->name);
+  free(feed->link);
+
+  feed->name = NULL;
+  feed->link = NULL;
+
+  free(feed);
+  feed = NULL;
+
+  return 0;
+}
+
+int free_feed_tag(struct feed_tag *feed_tag) {
+  free(feed_tag->tag_name);
+  feed_tag->tag_name = NULL;
+
+  free(feed_tag);
+  feed_tag = NULL;
+
+  return 0;
+}
+
 int free_tag(struct tag *tag) {
   free(tag->name);
   free(tag->color);
@@ -640,6 +845,57 @@ int free_tag(struct tag *tag) {
 
   free(tag);
   tag = NULL;
+
+  return 0;
+}
+
+int free_category(struct category *category) {
+  free(category->name);
+  free(category->color);
+
+  category->name = NULL;
+  category->color = NULL;
+
+  free(category);
+  category = NULL;
+
+  return 0;
+}
+
+int free_article(struct article *article) {
+  free(article->title);
+  free(article->source_name);
+  free(article->source_url);
+  free(article->summary);
+
+  article->title = NULL;
+  article->source_name = NULL;
+  article->source_url = NULL;
+  article->summary = NULL;
+
+  free(article);
+  article = NULL;
+
+  return 0;
+}
+
+int free_issue_section(struct issue_section *section) {
+  free(section->type);
+  free(section->category_name);
+  free(section->text_body);
+
+  section->type = NULL;
+  section->category_name = NULL;
+  section->text_body = NULL;
+
+  if (section->articles != NULL) {
+    free_articles(section->articles, section->articles_count);
+  }
+  section->articles = NULL;
+  section->articles_count = 0;
+
+  free(section);
+  section = NULL;
 
   return 0;
 }
@@ -711,6 +967,42 @@ int free_issues(struct issue **issues, size_t len) {
   return result_code;
 }
 
+int free_feeds(struct feed **feeds, size_t len) {
+  int result_code = 0;
+  for (int i = 0; i < len; i += 1) {
+    if (feeds[i] != NULL) {
+      result_code = free_feed(feeds[i]);
+
+      if (result_code != 0) {
+        return result_code;
+      }
+    }
+  }
+
+  free(feeds);
+  feeds = NULL;
+
+  return result_code;
+}
+
+int free_feed_tags(struct feed_tag **feed_tags, size_t len) {
+  int result_code = 0;
+  for (int i = 0; i < len; i += 1) {
+    if (feed_tags[i] != NULL) {
+      result_code = free_feed_tag(feed_tags[i]);
+
+      if (result_code != 0) {
+        return result_code;
+      }
+    }
+  }
+
+  free(feed_tags);
+  feed_tags = NULL;
+
+  return result_code;
+}
+
 int free_tags(struct tag **tags, size_t len) {
   int result_code = 0;
   for (int i = 0; i < len; i += 1) {
@@ -725,6 +1017,60 @@ int free_tags(struct tag **tags, size_t len) {
 
   free(tags);
   tags = NULL;
+
+  return result_code;
+}
+
+int free_categories(struct category **categories, size_t len) {
+  int result_code = 0;
+  for (int i = 0; i < len; i += 1) {
+    if (categories[i] != NULL) {
+      result_code = free_category(categories[i]);
+
+      if (result_code != 0) {
+        return result_code;
+      }
+    }
+  }
+
+  free(categories);
+  categories = NULL;
+
+  return result_code;
+}
+
+int free_articles(struct article **articles, size_t len) {
+  int result_code = 0;
+  for (int i = 0; i < len; i += 1) {
+    if (articles[i] != NULL) {
+      result_code = free_article(articles[i]);
+
+      if (result_code != 0) {
+        return result_code;
+      }
+    }
+  }
+
+  free(articles);
+  articles = NULL;
+
+  return result_code;
+}
+
+int free_issue_sections(struct issue_section **sections, size_t len) {
+  int result_code = 0;
+  for (int i = 0; i < len; i += 1) {
+    if (sections[i] != NULL) {
+      result_code = free_issue_section(sections[i]);
+
+      if (result_code != 0) {
+        return result_code;
+      }
+    }
+  }
+
+  free(sections);
+  sections = NULL;
 
   return result_code;
 }
@@ -815,128 +1161,149 @@ int error_reply_map(struct error_reply *err, int code, char *message,
   return 0;
 }
 
-int user_map(struct user *user, sqlite3_stmt *stmt, int start_index,
+int user_map(struct user *user, pg_row_t *row, int start_index,
              int end_index) {
-  if (start_index > end_index || user == NULL || stmt == NULL) {
+  if (start_index > end_index || user == NULL || row == NULL) {
     return -1;
   }
 
   printf(ANSI_BACKGROUND_AMBER " USER " ANSI_RESET_ALL "\n");
   // ID
-  MAP_INT(user->id, stmt, start_index, 1);
+  MAP_INT(user->id, row, start_index, 1);
   // Username
-  MAP_TEXT(user->username, stmt, start_index + 1, 0);
-  // Email
-  MAP_TEXT(user->email, stmt, start_index + 2, 1);
+  MAP_TEXT(user->username, row, start_index + 1, 0);
+  // Email (stored encrypted — decrypt right after mapping so every other
+  // caller of user_map, including user_to_cjson() and the JWT claim code
+  // in auth.c, always sees plaintext, unchanged from before encryption).
+  MAP_TEXT(user->email, row, start_index + 2, 1);
+  if (user->email != NULL) {
+    char *decrypted = crypto_decrypt_hex(user->email);
+    free(user->email);
+    user->email = decrypted;
+  }
   // Role
-  MAP_TEXT(user->role, stmt, start_index + 3, 1);
+  MAP_TEXT(user->role, row, start_index + 3, 1);
 
   // Link
-  MAP_TEXT(user->link, stmt, start_index + 4, 0);
+  MAP_TEXT(user->link, row, start_index + 4, 0);
 
   // Subscribed at
-  MAP_INT(user->subscribed_at, stmt, start_index + 5, 0);
+  MAP_INT(user->subscribed_at, row, start_index + 5, 0);
   // Is supporter
-  MAP_INT(user->is_supporter, stmt, start_index + 6, 1);
+  MAP_BOOL(user->is_supporter, row, start_index + 6, 1);
 
   // Created at
-  MAP_INT(user->created_at, stmt, start_index + 7, 1);
+  MAP_INT(user->created_at, row, start_index + 7, 1);
 
-  // Is email flagged
-  MAP_INT(user->is_email_flagged, stmt, start_index + 8, 0);
-  // Email flag reason
-  MAP_TEXT(user->email_flag_reason, stmt, start_index + 9, 0);
+  // Tracker consent
+  MAP_INT(user->tracker_pixel_consent_date, row, start_index + 8, 0);
 
   return 0;
 }
 
-int view_map(struct view *view, sqlite3_stmt *stmt, int start_index,
+int user_flag_map(struct user *user, pg_row_t *row, int start_index) {
+  if (user == NULL || row == NULL) {
+    return -1;
+  }
+
+  // Is email flagged
+  MAP_BOOL(user->is_email_flagged, row, start_index, 0);
+  // Email flag reason
+  MAP_TEXT(user->email_flag_reason, row, start_index + 1, 0);
+
+  return 0;
+}
+
+int view_map(struct view *view, pg_row_t *row, int start_index,
              int end_index) {
-  if (start_index > end_index || view == NULL || stmt == NULL) {
+  if (start_index > end_index || view == NULL || row == NULL) {
     return -1;
   }
 
   printf(ANSI_BACKGROUND_AMBER " USER " ANSI_RESET_ALL "\n");
   // ID
-  MAP_INT(view->id, stmt, start_index, 1);
+  MAP_INT(view->id, row, start_index, 1);
   // Username
-  MAP_INT(view->time, stmt, start_index + 1, 1);
+  MAP_INT(view->time, row, start_index + 1, 1);
   // Email
-  MAP_TEXT(view->hashed_ip, stmt, start_index + 2, 1);
+  MAP_TEXT(view->hashed_ip, row, start_index + 2, 1);
   // Role
-  MAP_INT(view->issue_id, stmt, start_index + 3, 1);
+  MAP_INT(view->issue_id, row, start_index + 3, 1);
 
   return 0;
 }
 
-int issue_map(struct issue *issue, sqlite3_stmt *stmt, int start_index,
+int issue_map(struct issue *issue, pg_row_t *row, int start_index,
               int end_index) {
-  if (start_index > end_index || issue == NULL || stmt == NULL) {
+  if (start_index > end_index || issue == NULL || row == NULL) {
     return -1;
   }
 
   printf(ANSI_BACKGROUND_AMBER " ISSUE " ANSI_RESET_ALL "\n");
   // ID
-  MAP_INT(issue->id, stmt, start_index, 1);
-  MAP_TEXT(issue->slug, stmt, start_index + 1, 1);
-  MAP_TEXT(issue->title, stmt, start_index + 2, 1);
-  MAP_TEXT(issue->subtitle, stmt, start_index + 3, 1);
-  MAP_INT(issue->created_at, stmt, start_index + 4, 1);
-  MAP_INT(issue->published_at, stmt, start_index + 5, 0);
-  MAP_INT(issue->updated_at, stmt, start_index + 6, 0);
-  MAP_INT(issue->issue_number, stmt, start_index + 7, 1);
-  MAP_TEXT(issue->excerpt, stmt, start_index + 8, 1);
-  MAP_TEXT(issue->content, stmt, start_index + 9, 1);
-  MAP_INT(issue->is_sponsored, stmt, start_index + 10, 0);
-  MAP_TEXT(issue->status, stmt, start_index + 11, 1);
-  MAP_INT(issue->opened_mail_count, stmt, start_index + 12, 0);
+  MAP_INT(issue->id, row, start_index, 1);
+  MAP_TEXT(issue->slug, row, start_index + 1, 1);
+  MAP_TEXT(issue->title, row, start_index + 2, 1);
+  MAP_TEXT(issue->subtitle, row, start_index + 3, 1);
+  MAP_INT(issue->created_at, row, start_index + 4, 1);
+  MAP_INT(issue->published_at, row, start_index + 5, 0);
+  MAP_INT(issue->updated_at, row, start_index + 6, 0);
+  MAP_INT(issue->issue_number, row, start_index + 7, 1);
+  MAP_TEXT(issue->excerpt, row, start_index + 8, 1);
+  MAP_BOOL(issue->is_sponsored, row, start_index + 9, 0);
+  MAP_TEXT(issue->status, row, start_index + 10, 1);
+  MAP_INT(issue->opened_mail_count, row, start_index + 11, 0);
+  MAP_TEXT(issue->vod_url, row, start_index + 12, 0);
+  MAP_INT(issue->views, row, start_index + 13, 0);
+  printf("\n");
 
   return 0;
 }
-int issue_author_map(struct issue_author *issue, sqlite3_stmt *stmt,
+int issue_author_map(struct issue_author *issue, pg_row_t *row,
                      int start_index, int end_index) {
-  if (start_index > end_index || issue == NULL || stmt == NULL) {
+  if (start_index > end_index || issue == NULL || row == NULL) {
     return -1;
   }
 
   printf(ANSI_BACKGROUND_AMBER " ISSUE AUTHOR " ANSI_RESET_ALL "\n");
   // ID
-  MAP_INT(issue->issue_id, stmt, start_index, 1);
-  MAP_INT(issue->user_id, stmt, start_index + 1, 1);
+  MAP_INT(issue->issue_id, row, start_index, 1);
+  MAP_INT(issue->user_id, row, start_index + 1, 1);
 
   return 0;
 }
-int issue_sponsor_map(struct issue_sponsor *issue, sqlite3_stmt *stmt,
+int issue_sponsor_map(struct issue_sponsor *issue, pg_row_t *row,
                       int start_index, int end_index) {
-  if (start_index > end_index || issue == NULL || stmt == NULL) {
+  if (start_index > end_index || issue == NULL || row == NULL) {
     return -1;
   }
 
   printf(ANSI_BACKGROUND_AMBER " ISSUE SPONSOR " ANSI_RESET_ALL "\n");
   // ID
-  MAP_INT(issue->issue_id, stmt, start_index, 1);
-  MAP_TEXT(issue->sponsor_name, stmt, start_index + 1, 1);
-  MAP_TEXT(issue->link, stmt, start_index + 2, 1);
+  MAP_INT(issue->issue_id, row, start_index, 1);
+  MAP_TEXT(issue->sponsor_name, row, start_index + 1, 1);
+  MAP_TEXT(issue->issue_link, row, start_index + 2, 1);
+  MAP_TEXT(issue->link, row, start_index + 3, 1);
 
   return 0;
 }
-int issue_tag_map(struct issue_tag *issue, sqlite3_stmt *stmt, int start_index,
+int issue_tag_map(struct issue_tag *issue, pg_row_t *row, int start_index,
                   int end_index) {
-  if (start_index > end_index || issue == NULL || stmt == NULL) {
+  if (start_index > end_index || issue == NULL || row == NULL) {
     return -1;
   }
 
   printf(ANSI_BACKGROUND_AMBER " ISSUE TAG " ANSI_RESET_ALL "\n");
   // ID
-  MAP_INT(issue->issue_id, stmt, start_index, 1);
-  MAP_TEXT(issue->tag_name, stmt, start_index + 1, 1);
+  MAP_INT(issue->issue_id, row, start_index, 1);
+  MAP_TEXT(issue->tag_name, row, start_index + 1, 1);
 
   return 0;
 }
 
-int media_map(struct media *media, sqlite3_stmt *stmt, int start_index,
+int media_map(struct media *media, pg_row_t *row, int start_index,
               int end_index) {
-  if (start_index > end_index || media == NULL || stmt == NULL) {
+  if (start_index > end_index || media == NULL || row == NULL) {
     return -1;
   }
 
@@ -945,42 +1312,115 @@ int media_map(struct media *media, sqlite3_stmt *stmt, int start_index,
   int url_index = start_index + 2;
   int width_index = start_index + 3;
   int height_index = start_index + 4;
+  int thumb_index = start_index + 5;
 
-  MAP_INT(media->id, stmt, id_index, 1);
-  MAP_TEXT(media->alternative_text, stmt, alt_index, 1);
-  MAP_TEXT(media->url, stmt, url_index, 1);
-  MAP_DOUBLE(media->width, stmt, width_index, 0);
-  MAP_DOUBLE(media->height, stmt, height_index, 0);
+  MAP_INT(media->id, row, id_index, 1);
+  MAP_TEXT(media->alternative_text, row, alt_index, 1);
+  MAP_TEXT(media->url, row, url_index, 1);
+  MAP_DOUBLE(media->width, row, width_index, 0);
+  MAP_DOUBLE(media->height, row, height_index, 0);
+  MAP_TEXT(media->thumb_url, row, thumb_index, 0);
 
   return 0;
 }
 
-int tag_map(struct tag *tag, sqlite3_stmt *stmt, int start_index,
+int feed_map(struct feed *feed, pg_row_t *row, int start_index,
             int end_index) {
-  if (start_index > end_index || tag == NULL || stmt == NULL) {
+  if (start_index > end_index || feed == NULL || row == NULL) {
+    return -1;
+  }
+
+  MAP_INT(feed->id, row, start_index, 1);
+  MAP_TEXT(feed->name, row, start_index + 1, 1);
+  MAP_TEXT(feed->link, row, start_index + 2, 1);
+  MAP_BOOL(feed->is_rss_feed, row, start_index + 3, 1);
+
+  return 0;
+}
+
+int feed_tag_map(struct feed_tag *feed_tag, pg_row_t *row,
+                 int start_index, int end_index) {
+  if (start_index > end_index || feed_tag == NULL || row == NULL) {
+    return -1;
+  }
+
+  MAP_INT(feed_tag->feed_id, row, start_index, 1);
+  MAP_TEXT(feed_tag->tag_name, row, start_index + 1, 1);
+
+  return 0;
+}
+
+int category_map(struct category *category, pg_row_t *row,
+                 int start_index, int end_index) {
+  if (start_index > end_index || category == NULL || row == NULL) {
+    return -1;
+  }
+
+  MAP_TEXT(category->name, row, start_index, 1);
+  MAP_TEXT(category->color, row, start_index + 1, 1);
+
+  return 0;
+}
+
+int article_map(struct article *article, pg_row_t *row, int start_index,
+                int end_index) {
+  if (start_index > end_index || article == NULL || row == NULL) {
+    return -1;
+  }
+
+  MAP_INT(article->id, row, start_index, 1);
+  MAP_INT(article->section_id, row, start_index + 1, 1);
+  MAP_INT(article->position, row, start_index + 2, 1);
+  MAP_TEXT(article->title, row, start_index + 3, 1);
+  MAP_TEXT(article->source_name, row, start_index + 4, 1);
+  MAP_TEXT(article->source_url, row, start_index + 5, 1);
+  MAP_TEXT(article->summary, row, start_index + 6, 1);
+
+  return 0;
+}
+
+int issue_section_map(struct issue_section *section, pg_row_t *row,
+                      int start_index, int end_index) {
+  if (start_index > end_index || section == NULL || row == NULL) {
+    return -1;
+  }
+
+  MAP_INT(section->id, row, start_index, 1);
+  MAP_INT(section->issue_id, row, start_index + 1, 1);
+  MAP_INT(section->position, row, start_index + 2, 1);
+  MAP_TEXT(section->type, row, start_index + 3, 1);
+  MAP_TEXT(section->category_name, row, start_index + 4, 0);
+  MAP_TEXT(section->text_body, row, start_index + 5, 0);
+
+  return 0;
+}
+
+int tag_map(struct tag *tag, pg_row_t *row, int start_index,
+            int end_index) {
+  if (start_index > end_index || tag == NULL || row == NULL) {
     return -1;
   }
 
   int name_index = start_index;
   int color_index = start_index + 1;
 
-  MAP_TEXT(tag->name, stmt, name_index, 1);
-  MAP_TEXT(tag->color, stmt, color_index, 1);
+  MAP_TEXT(tag->name, row, name_index, 1);
+  MAP_TEXT(tag->color, row, color_index, 1);
 
   return 0;
 }
 
-int sponsor_map(struct sponsor *sponsor, sqlite3_stmt *stmt, int start_index,
+int sponsor_map(struct sponsor *sponsor, pg_row_t *row, int start_index,
                 int end_index) {
-  if (start_index > end_index || sponsor == NULL || stmt == NULL) {
+  if (start_index > end_index || sponsor == NULL || row == NULL) {
     return -1;
   }
 
   int name_index = start_index;
   int link_index = start_index + 1;
 
-  MAP_TEXT(sponsor->name, stmt, name_index, 1);
-  MAP_TEXT(sponsor->link, stmt, link_index, 1);
+  MAP_TEXT(sponsor->name, row, name_index, 1);
+  MAP_TEXT(sponsor->link, row, link_index, 1);
 
   return 0;
 }
@@ -1019,14 +1459,26 @@ void user_hydrate(struct mg_http_message *msg, struct user *user) {
     } else if (mg_strcmp(key, mg_str("\"pictureId\"")) == 0) {
       number_parsed = mg_str_to_num(val, 10, &number, sizeof(int));
       if (number_parsed && number > 0) {
-        if (user->picture == NULL) {
-          user->picture = malloc(sizeof(struct media));
-          user->picture->alternative_text = NULL;
-          user->picture->url = NULL;
-          user->picture->width = 0;
-          user->picture->height = 0;
+        if (user->picture != NULL) {
+          free_media(user->picture);
+          user->picture = NULL;
         }
-        user->picture->id = number;
+
+        struct media *m = malloc(sizeof(struct media));
+        m->id = 0;
+        m->alternative_text = NULL;
+        m->url = NULL;
+        m->thumb_url = NULL;
+        m->width = 0;
+        m->height = 0;
+
+        if (get_media(m, number) != 0) {
+          fprintf(stderr,
+                  TERMINAL_ERROR_MESSAGE("PICTURE ID NOT FOUND ON HYDRATE"));
+          m->id = number;
+        }
+
+        user->picture = m;
       }
     }
   }
@@ -1071,10 +1523,6 @@ void issue_hydrate(struct mg_http_message *msg, struct issue *issue) {
       printf("SLUG: %.*s\n", (int)val.len, val.buf);
       issue->slug = malloc(val.len);
       sprintf(issue->slug, "%.*s", (int)val.len - 2, val.buf + 1);
-    } else if (mg_strcmp(key, mg_str("\"content\"")) == 0) {
-      printf("CONTENT: %.*s\n", (int)val.len, val.buf);
-      issue->content = malloc(val.len);
-      sprintf(issue->content, "%.*s", (int)val.len - 2, val.buf + 1);
     } else if (mg_strcmp(key, mg_str("\"subtitle\"")) == 0) {
       printf("SUBTITLE: %.*s\n", (int)val.len, val.buf);
       issue->subtitle = malloc(val.len);
@@ -1087,6 +1535,10 @@ void issue_hydrate(struct mg_http_message *msg, struct issue *issue) {
       printf("EXCERPT: %.*s\n", (int)val.len, val.buf);
       issue->excerpt = malloc(val.len);
       sprintf(issue->excerpt, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"vodUrl\"")) == 0) {
+      printf("VOD URL: %.*s\n", (int)val.len, val.buf);
+      issue->vod_url = malloc(val.len);
+      sprintf(issue->vod_url, "%.*s", (int)val.len - 2, val.buf + 1);
     } else if (mg_strcmp(key, mg_str("\"id\"")) == 0) {
       number_parsed = mg_str_to_num(val, 10, &number, sizeof(int));
       if (number_parsed) {
@@ -1118,9 +1570,9 @@ void issue_hydrate(struct mg_http_message *msg, struct issue *issue) {
         issue->issue_number = number;
       }
     } else if (mg_strcmp(key, mg_str("\"isSponsored\"")) == 0) {
-      number_parsed = mg_str_to_num(val, 10, &number, sizeof(int));
-      if (number_parsed) {
-        issue->is_sponsored = number;
+      bool value = false;
+      if (mg_json_get_bool(val, "$", &value)) {
+        issue->is_sponsored = value;
       }
     } else if (mg_strcmp(key, mg_str("\"coverId\"")) == 0) {
       number_parsed = mg_str_to_num(val, 10, &number, sizeof(int));
@@ -1212,6 +1664,57 @@ void issue_tag_hydrate(struct mg_http_message *msg, struct issue_tag *issue) {
   }
 }
 
+void feed_hydrate(struct mg_http_message *msg, struct feed *feed) {
+  struct mg_str key, val;
+  int number;
+  bool number_parsed;
+
+  size_t ofs = 0;
+  while ((ofs = mg_json_next(msg->body, ofs, &key, &val)) > 0) {
+    printf("%.*s -> %.*s\n", (int)key.len, key.buf, (int)val.len, val.buf);
+
+    if (mg_strcmp(key, mg_str("\"name\"")) == 0) {
+      printf("NAME: %.*s\n", (int)val.len, val.buf);
+      feed->name = malloc(val.len);
+      sprintf(feed->name, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"link\"")) == 0) {
+      printf("LINK: %.*s\n", (int)val.len, val.buf);
+      feed->link = malloc(val.len);
+      sprintf(feed->link, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"isRssFeed\"")) == 0) {
+      if (mg_strcmp(val, mg_str("true")) == 0) {
+        feed->is_rss_feed = 1;
+      } else if (mg_strcmp(val, mg_str("false")) == 0) {
+        feed->is_rss_feed = 0;
+      }
+    }
+  }
+}
+
+void feed_tag_hydrate(struct mg_http_message *msg,
+                      struct feed_tag *feed_tag) {
+  struct mg_str key, val;
+  int number;
+  bool number_parsed;
+
+  size_t ofs = 0;
+  while ((ofs = mg_json_next(msg->body, ofs, &key, &val)) > 0) {
+    printf("%.*s -> %.*s\n", (int)key.len, key.buf, (int)val.len, val.buf);
+
+    if (mg_strcmp(key, mg_str("\"feedId\"")) == 0) {
+      number_parsed = mg_str_to_num(val, 10, &number, sizeof(int));
+      if (number_parsed) {
+        feed_tag->feed_id = number;
+      }
+    }
+    if (mg_strcmp(key, mg_str("\"tagName\"")) == 0) {
+      printf("TAG NAME: %.*s\n", (int)val.len, val.buf);
+      feed_tag->tag_name = malloc(val.len);
+      sprintf(feed_tag->tag_name, "%.*s", (int)val.len - 2, val.buf + 1);
+    }
+  }
+}
+
 void tag_hydrate(struct mg_http_message *msg, struct tag *tag) {
   struct mg_str key, val;
   int number;
@@ -1229,6 +1732,78 @@ void tag_hydrate(struct mg_http_message *msg, struct tag *tag) {
       printf("COLOR: %.*s\n", (int)val.len, val.buf);
       tag->color = malloc(val.len);
       sprintf(tag->color, "%.*s", (int)val.len - 2, val.buf + 1);
+    }
+  }
+}
+
+void category_hydrate(struct mg_http_message *msg, struct category *category) {
+  struct mg_str key, val;
+  int number;
+  bool number_parsed;
+
+  size_t ofs = 0;
+  while ((ofs = mg_json_next(msg->body, ofs, &key, &val)) > 0) {
+    printf("%.*s -> %.*s\n", (int)key.len, key.buf, (int)val.len, val.buf);
+
+    if (mg_strcmp(key, mg_str("\"name\"")) == 0) {
+      printf("NAME: %.*s\n", (int)val.len, val.buf);
+      category->name = malloc(val.len);
+      sprintf(category->name, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"color\"")) == 0) {
+      printf("COLOR: %.*s\n", (int)val.len, val.buf);
+      category->color = malloc(val.len);
+      sprintf(category->color, "%.*s", (int)val.len - 2, val.buf + 1);
+    }
+  }
+}
+
+void article_hydrate(struct mg_http_message *msg, struct article *article) {
+  struct mg_str key, val;
+
+  size_t ofs = 0;
+  while ((ofs = mg_json_next(msg->body, ofs, &key, &val)) > 0) {
+    printf("%.*s -> %.*s\n", (int)key.len, key.buf, (int)val.len, val.buf);
+
+    if (mg_strcmp(key, mg_str("\"title\"")) == 0) {
+      printf("TITLE: %.*s\n", (int)val.len, val.buf);
+      article->title = malloc(val.len);
+      sprintf(article->title, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"sourceName\"")) == 0) {
+      printf("SOURCE NAME: %.*s\n", (int)val.len, val.buf);
+      article->source_name = malloc(val.len);
+      sprintf(article->source_name, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"sourceUrl\"")) == 0) {
+      printf("SOURCE URL: %.*s\n", (int)val.len, val.buf);
+      article->source_url = malloc(val.len);
+      sprintf(article->source_url, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"summary\"")) == 0) {
+      // Markdown string — mg_json_get_str() unescapes it and allocates.
+      printf("SUMMARY: %.*s\n", (int)val.len, val.buf);
+      article->summary = mg_json_get_str(msg->body, "$.summary");
+    }
+  }
+}
+
+void issue_section_hydrate(struct mg_http_message *msg,
+                           struct issue_section *section) {
+  struct mg_str key, val;
+
+  size_t ofs = 0;
+  while ((ofs = mg_json_next(msg->body, ofs, &key, &val)) > 0) {
+    printf("%.*s -> %.*s\n", (int)key.len, key.buf, (int)val.len, val.buf);
+
+    if (mg_strcmp(key, mg_str("\"type\"")) == 0) {
+      printf("TYPE: %.*s\n", (int)val.len, val.buf);
+      section->type = malloc(val.len);
+      sprintf(section->type, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"categoryName\"")) == 0) {
+      printf("CATEGORY NAME: %.*s\n", (int)val.len, val.buf);
+      section->category_name = malloc(val.len);
+      sprintf(section->category_name, "%.*s", (int)val.len - 2, val.buf + 1);
+    } else if (mg_strcmp(key, mg_str("\"textBody\"")) == 0) {
+      // Markdown string — mg_json_get_str() unescapes it and allocates.
+      printf("TEXT BODY: %.*s\n", (int)val.len, val.buf);
+      section->text_body = mg_json_get_str(msg->body, "$.textBody");
     }
   }
 }
@@ -1263,13 +1838,15 @@ int user_init(struct user *user) {
   user->username = NULL;
   user->email = NULL;
   user->role = NULL;
+  user->totp_seed = NULL;
 
-  user->link    = NULL;
+  user->link = NULL;
   user->picture = NULL;
 
-  user->subscribed_at     = 0;
-  user->is_supporter      = 0;
-  user->is_email_flagged  = 0;
+  user->subscribed_at = 0;
+  user->is_supporter = 0;
+  user->tracker_pixel_consent_date = 0;
+  user->is_email_flagged = 0;
   user->email_flag_reason = NULL;
 
   return 0;
@@ -1298,11 +1875,12 @@ int issue_init(struct issue *issue) {
   issue->subtitle = NULL;
 
   issue->excerpt = NULL;
-  issue->content = NULL;
   issue->status = NULL;
+  issue->vod_url = NULL;
 
   issue->published_at = 0;
   issue->updated_at = 0;
+  issue->views = 0;
 
   issue->cover = NULL;
 
@@ -1312,6 +1890,8 @@ int issue_init(struct issue *issue) {
   issue->authors_count = 0;
   issue->sponsors = NULL;
   issue->sponsors_count = 0;
+  issue->sections = NULL;
+  issue->sections_count = 0;
 
   return 0;
 }
@@ -1330,6 +1910,7 @@ int issue_sponsor_init(struct issue_sponsor *issue) {
   }
   issue->issue_id = 0;
   issue->sponsor_name = NULL;
+  issue->issue_link = NULL;
   issue->link = NULL;
 
   return 0;
@@ -1344,6 +1925,30 @@ int issue_tag_init(struct issue_tag *issue) {
   return 0;
 }
 
+int feed_init(struct feed *feed) {
+  if (feed == NULL) {
+    return -1;
+  }
+
+  feed->id = 0;
+  feed->name = NULL;
+  feed->link = NULL;
+  feed->is_rss_feed = 0;
+
+  return 0;
+}
+
+int feed_tag_init(struct feed_tag *feed_tag) {
+  if (feed_tag == NULL) {
+    return -1;
+  }
+
+  feed_tag->feed_id = 0;
+  feed_tag->tag_name = NULL;
+
+  return 0;
+}
+
 int tag_init(struct tag *tag) {
   if (tag == NULL) {
     return -1;
@@ -1351,6 +1956,50 @@ int tag_init(struct tag *tag) {
 
   tag->name = NULL;
   tag->color = NULL;
+
+  return 0;
+}
+
+int category_init(struct category *category) {
+  if (category == NULL) {
+    return -1;
+  }
+
+  category->name = NULL;
+  category->color = NULL;
+
+  return 0;
+}
+
+int article_init(struct article *article) {
+  if (article == NULL) {
+    return -1;
+  }
+
+  article->id = 0;
+  article->section_id = 0;
+  article->position = 0;
+  article->title = NULL;
+  article->source_name = NULL;
+  article->source_url = NULL;
+  article->summary = NULL;
+
+  return 0;
+}
+
+int issue_section_init(struct issue_section *section) {
+  if (section == NULL) {
+    return -1;
+  }
+
+  section->id = 0;
+  section->issue_id = 0;
+  section->position = 0;
+  section->type = NULL;
+  section->category_name = NULL;
+  section->text_body = NULL;
+  section->articles = NULL;
+  section->articles_count = 0;
 
   return 0;
 }

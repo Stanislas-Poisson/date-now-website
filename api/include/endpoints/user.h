@@ -28,8 +28,8 @@ void send_users_res(struct mg_connection *c, struct mg_http_message *msg,
  * @brief Handles GET/PUT/DELETE /user/:id — fetch, update, or delete a user.
  *
  * GET: returns the full user object. Requires authentication.
- * PUT: updates the user and returns the updated object. Requires authentication.
- * DELETE: deletes the user. Requires authentication.
+ * PUT: updates the user and returns the updated object. Requires
+ * authentication. DELETE: deletes the user. Requires authentication.
  *
  * @param c           Active Mongoose connection.
  * @param msg         Parsed HTTP message.
@@ -41,11 +41,42 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
                    struct error_reply *error_reply, const char *secret);
 
 /**
- * @brief Handles PUT /user/:id/flag — manually flag or unflag a user's email.
+ * @brief Handles GET /user/count — returns the total number of users.
  *
- * Requires AUTHOR authentication.
- * Body: {"flagged": 1, "reason": "manual_override"}
- *       "reason" is optional when flagged = 0.
+ * Accepts an optional `type` query parameter: "subscriber" filters to users
+ * with a non-null subscribedAt; "author" filters to users with role AUTHOR.
+ * Requires authentication. Returns { "count": integer }.
+ *
+ * @param c           Active Mongoose connection.
+ * @param msg         Parsed HTTP message.
+ * @param error_reply Pre-allocated error reply structure.
+ * @param secret      JWT signing secret (not freed).
+ */
+void send_user_count_res(struct mg_connection *c, struct mg_http_message *msg,
+                         struct error_reply *error_reply, const char *secret);
+
+/**
+ * @brief Handles GET /user/current — returns the current user based on JWT auth
+ * token
+ *
+ * Requires authentication. Returns the current user.
+ *
+ * @param c           Active Mongoose connection.
+ * @param msg         Parsed HTTP message.
+ * @param error_reply Pre-allocated error reply structure.
+ * @param secret      JWT signing secret (not freed).
+ */
+void send_current_user_res(struct mg_connection *c, struct mg_http_message *msg,
+                           struct error_reply *error_reply, const char *secret);
+
+/**
+ * @brief Handles PUT /user/:id/flag — flag or unflag the email of a user by
+ *        hand.
+ *
+ * Requires an authenticated author. Body: {"flagged": 1, "reason": "spam"}.
+ * "flagged" is 0 or 1; "reason" is optional (at most 100 characters, default
+ * "manual_override") and only kept when "flagged" is 1. A flagged user does not
+ * receive the newsletter.
  *
  * @param c           Active Mongoose connection.
  * @param msg         Parsed HTTP message.

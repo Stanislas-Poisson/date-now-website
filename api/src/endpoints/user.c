@@ -4,7 +4,9 @@
  */
 
 #include <endpoints/auth.h>
+#include <endpoints/media.h>
 #include <enums.h>
+#include <lib/email_admission.h>
 #include <lib/email_validator.h>
 #include <lib/mongoose.h>
 #include <lib/validatejson.h>
@@ -20,6 +22,8 @@
 #include <structs.h>
 #include <utils.h>
 
+/** Longest reason of an email flag set by hand. */
+#define FLAG_REASON_MAX_LEN 100
 
 void send_users_res(struct mg_connection *c, struct mg_http_message *msg,
                     struct error_reply *error_reply, const char *secret) {
@@ -49,8 +53,7 @@ void send_users_res(struct mg_connection *c, struct mg_http_message *msg,
     if (mg_str_to_num(page_str, 10, &page, sizeof(int)) == false)
       page = -1;
     else {
-      struct mg_str page_size_str =
-          mg_http_var(msg->query, mg_str("limit"));
+      struct mg_str page_size_str = mg_http_var(msg->query, mg_str("limit"));
       if (mg_str_to_num(page_size_str, 10, &page_size, sizeof(int)) == false)
         page_size = 20;
     }
@@ -126,7 +129,7 @@ void send_users_res(struct mg_connection *c, struct mg_http_message *msg,
   } else if (mg_match(msg->method, mg_str("POST"), NULL)) {
     // Check if user logged
     int user_logged = 0;
-    is_user_logged(c, msg, error_reply, secret, &user_logged);
+    is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
 
     if (user_logged == 0) {
       ERROR_REPLY_401;
@@ -168,7 +171,7 @@ void send_users_res(struct mg_connection *c, struct mg_http_message *msg,
         username = strndup(msg->body.buf + offset + 1, length - 2);
       }
 
-      int exists = user_identity_exists(username, email);
+      int exists = user_identity_exists(username, email, -1);
       if (exists != 0) {
         ERROR_REPLY_400(USER_EXISTS_MESSAGE);
         return;
@@ -275,7 +278,7 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
   } else if (mg_match(msg->method, mg_str("PUT"), NULL)) {
     // Check if user logged
     int user_logged = 0;
-    is_user_logged(c, msg, error_reply, secret, &user_logged);
+    is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
 
     if (user_logged == 0) {
       ERROR_REPLY_401;
@@ -295,16 +298,19 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
     struct user *user = malloc(sizeof(struct user));
 
     int offset, length;
-    struct email_admission_result admission = {0};
-    admission.allowed = 1;
 
-    // Email optional on PUT - run admission checks if provided
+    // Set when the body gives an email: the flag of the user follows it
+    int email_changed = 0;
+    int email_flagged = 0;
+
+    // Email required
     offset = mg_json_get(msg->body, "$.email", &length);
     if (offset >= 0) {
+      // Email and username not existing already
       char *email = mg_json_get_str(msg->body, "$.email");
       printf("%s\n", email);
 
-      // Check format validity
+      // Check if email validity
       int email_valid = check_email_validity(email);
       if (email_valid != 0) {
         ERROR_REPLY_400(EMAIL_VALIDITY_ERROR_MESSAGE);
@@ -313,27 +319,25 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
         return;
       }
 
-      // Run full email admission pipeline
+      // The email domain must be accepted, and tells whether the user is flagged
+      struct email_admission_result admission = {0};
       email_admission_inspect(email, &admission);
       if (!admission.allowed) {
-        if (admission.reason_code == EMAIL_ADMISSION_DNS_FAIL) {
-          ERROR_REPLY_400(EMAIL_DOMAIN_UNRESOLVABLE_MESSAGE);
-        } else if (admission.reason_code == EMAIL_ADMISSION_APP_DOMAIN) {
-          ERROR_REPLY_400(EMAIL_DOMAIN_SELF_MESSAGE);
-        } else {
-          ERROR_REPLY_400(EMAIL_DOMAIN_BLOCKED_MESSAGE);
-        }
+        ERROR_REPLY_EMAIL_ADMISSION(admission.reason_code);
         free(email);
         free(user);
         return;
       }
+      email_changed = 1;
+      email_flagged = admission.is_flagged;
 
       char *username = NULL;
-      int uname_offset = mg_json_get(msg->body, "$.username", &length);
-      if (uname_offset >= 0) {
-        username = strndup(msg->body.buf + uname_offset + 1, length - 2);
+      offset = mg_json_get(msg->body, "$.username", &length);
+      if (offset >= 0) {
+        username = strndup(msg->body.buf + offset + 1, length - 2);
       }
-      int exists = user_identity_exists(username, email);
+
+      int exists = user_identity_exists(username, email, id);
       free(username);
       free(email);
       if (exists != 0) {
@@ -348,7 +352,7 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
     char role[10];
     if (length > 10) {
       ERROR_REPLY_400(ROLE_FORMAT_MESSAGE);
-      free(user);
+
       return;
     }
     if (offset >= 0) {
@@ -357,7 +361,6 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
 
       if (strcmp(role, "USER") != 0 && strcmp(role, "AUTHOR") != 0) {
         ERROR_REPLY_400(ROLE_FORMAT_MESSAGE);
-        free(user);
         return;
       }
     }
@@ -370,14 +373,10 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
       return;
     }
 
-    user_hydrate(msg, user);
+    // Remembered before hydration, which overwrites picture->id in place.
+    int previous_picture_id = user->picture != NULL ? user->picture->id : 0;
 
-    // Apply flag state from admission check
-    if (admission.is_flagged) {
-      user->is_email_flagged  = 1;
-      free(user->email_flag_reason);
-      user->email_flag_reason = strdup("blocked_domain");
-    }
+    user_hydrate(msg, user);
 
     // Store in DB
     query_code = edit_user(user);
@@ -386,6 +385,23 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
       HANDLE_QUERY_CODE;
 
       return;
+    }
+
+    // The flag follows the new email. The user is already saved, so a failure
+    // here is logged, never fatal.
+    if (email_changed &&
+        refresh_user_email_flag(id, email_flagged, user) != 0) {
+      fprintf(stderr, TERMINAL_ERROR_MESSAGE("COULD NOT UPDATE EMAIL FLAG"));
+    }
+
+    // Profile picture replaced: drop the previous one rather than leaking it.
+    // The user is already saved, so a failure here is logged, never fatal.
+    int new_picture_id = user->picture != NULL ? user->picture->id : 0;
+    if (previous_picture_id > 0 && previous_picture_id != new_picture_id) {
+      if (delete_media_with_blob(previous_picture_id) != 0) {
+        fprintf(stderr,
+                TERMINAL_ERROR_MESSAGE("COULD NOT DELETE REPLACED PICTURE"));
+      }
     }
 
     char *result = user_to_json(user);
@@ -397,7 +413,7 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
   } else if (mg_match(msg->method, mg_str("DELETE"), NULL)) {
     // Check if user logged
     int user_logged = 0;
-    is_user_logged(c, msg, error_reply, secret, &user_logged);
+    is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
 
     if (user_logged == 0) {
       ERROR_REPLY_401;
@@ -418,21 +434,94 @@ void send_user_res(struct mg_connection *c, struct mg_http_message *msg, int id,
   }
 }
 
+void send_user_count_res(struct mg_connection *c, struct mg_http_message *msg,
+                         struct error_reply *error_reply, const char *secret) {
+  struct error_reply _er = {0};
+  error_reply = &_er;
+
+  if (!mg_match(msg->method, mg_str("GET"), NULL)) {
+    ERROR_REPLY_405;
+    return;
+  }
+
+  printf(TERMINAL_ENDPOINT_MESSAGE("=== GET USER COUNT ==="));
+
+  int user_logged = 0;
+  is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
+  if (user_logged == 0) {
+    ERROR_REPLY_401;
+    return;
+  }
+
+  char type_buf[16] = "";
+  const char *type = NULL;
+  int type_len =
+      mg_http_get_var(&msg->query, "type", type_buf, sizeof(type_buf));
+  if (type_len > 0) {
+    if (strcmp(type_buf, "subscriber") == 0 ||
+        strcmp(type_buf, "author") == 0) {
+      type = type_buf;
+    } else {
+      ERROR_REPLY_400("Invalid type parameter");
+      return;
+    }
+  }
+
+  int count = get_users_count(type);
+  if (count < 0) {
+    ERROR_REPLY_500;
+    return;
+  }
+
+  char json[32];
+  snprintf(json, sizeof(json), "{\"count\":%d}", count);
+  SUCCESS_REPLY_200(json);
+}
+
+void send_current_user_res(struct mg_connection *c, struct mg_http_message *msg,
+                           struct error_reply *error_reply,
+                           const char *secret) {
+  struct error_reply _er = {0};
+  error_reply = &_er;
+
+  if (!mg_match(msg->method, mg_str("GET"), NULL)) {
+    ERROR_REPLY_405;
+    return;
+  }
+
+  printf(TERMINAL_ENDPOINT_MESSAGE("=== GET CURRENT USER ==="));
+
+  struct user *user = malloc(sizeof(struct user));
+  int user_init_rc = user_init(user);
+  if (user_init_rc != 0) {
+    free(user);
+    ERROR_REPLY_500;
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("USER IS NULL"));
+    return;
+  }
+
+  int user_logged = 0;
+  is_user_logged(c, msg, error_reply, secret, &user_logged, user);
+  if (user_logged == 0) {
+    free_user(user);
+    ERROR_REPLY_401;
+    return;
+  }
+  char *result = user_to_json(user);
+
+  SUCCESS_REPLY_200(result);
+  free(result);
+  printf(TERMINAL_SUCCESS_MESSAGE("=== USER SUCCESSFULLY SENT ==="));
+
+  free_user(user);
+}
+
 void send_user_flag_res(struct mg_connection *c, struct mg_http_message *msg,
                         int id, struct error_reply *error_reply,
                         const char *secret) {
   int query_code;
   struct error_reply _er = {0};
   error_reply = &_er;
-
-  // Require AUTHOR auth
-  int user_logged = 0;
-  is_user_logged(c, msg, error_reply, secret, &user_logged);
-  if (user_logged == 0) {
-    ERROR_REPLY_401;
-    fprintf(stderr, TERMINAL_ERROR_MESSAGE(UNAUTHORIZED_MESSAGE));
-    return;
-  }
 
   if (!mg_match(msg->method, mg_str("PUT"), NULL)) {
     ERROR_REPLY_405;
@@ -441,11 +530,11 @@ void send_user_flag_res(struct mg_connection *c, struct mg_http_message *msg,
 
   printf(TERMINAL_ENDPOINT_MESSAGE("=== SET USER EMAIL FLAG ==="));
 
-  // Check user exists
-  int exists = user_exists(id);
-  if (!exists) {
-    ERROR_REPLY_404;
-    fprintf(stderr, TERMINAL_ERROR_MESSAGE("USER NOT FOUND"));
+  int user_logged = 0;
+  is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
+  if (user_logged == 0) {
+    ERROR_REPLY_401;
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE(UNAUTHORIZED_MESSAGE));
     return;
   }
 
@@ -457,27 +546,24 @@ void send_user_flag_res(struct mg_connection *c, struct mg_http_message *msg,
     return;
   }
 
-  int offset, length = 0;
-
-  // "flagged" is required
-  REQUIRED_BODY_PROPERTY("flagged", FLAG_REQUIRED_MESSAGE);
-  int flagged = 0;
-  struct mg_str flagged_val = {.buf = msg->body.buf + offset, .len = (size_t)length};
-  mg_str_to_num(flagged_val, 10, &flagged, sizeof(int));
-
-  // "reason" is optional
-  char *reason = NULL;
-  offset = mg_json_get(msg->body, "$.reason", &length);
-  if (offset >= 0) {
-    reason = malloc((size_t)length - 1);
-    strncpy(reason, msg->body.buf + offset + 1, (size_t)length - 2);
-    reason[length - 2] = '\0';
-  } else if (flagged) {
-    // Default reason for manual flag
-    reason = strdup("manual_override");
+  // "flagged" is required: 0 or 1, like isSupporter and isEmailFlagged
+  long flagged = mg_json_get_long(msg->body, "$.flagged", -1);
+  if (flagged != 0 && flagged != 1) {
+    ERROR_REPLY_400(FLAG_REQUIRED_MESSAGE);
+    return;
   }
 
-  query_code = set_user_email_flag(id, flagged, reason);
+  // "reason" is optional, and only kept when the email is flagged
+  char *reason = mg_json_get_str(msg->body, "$.reason");
+  if (reason != NULL && strlen(reason) > FLAG_REASON_MAX_LEN) {
+    ERROR_REPLY_400(FLAG_REASON_MESSAGE);
+    free(reason);
+    return;
+  }
+  const char *flag_reason =
+      reason != NULL && reason[0] != '\0' ? reason : "manual_override";
+
+  query_code = set_user_email_flag(id, (int)flagged, flag_reason);
   free(reason);
 
   if (query_code != 0) {

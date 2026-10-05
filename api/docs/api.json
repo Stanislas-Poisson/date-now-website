@@ -64,7 +64,13 @@
         "code": 500,
         "message": "Internal server error"
       },
-      "appliesTo": ["GET-list", "GET-single", "POST", "PUT", "DELETE"]
+      "appliesTo": [
+        "GET-list",
+        "GET-single",
+        "POST",
+        "PUT",
+        "DELETE"
+      ]
     }
   ],
   "tables": [
@@ -83,7 +89,7 @@
           "uri": "/subscribe",
           "method": "POST",
           "tokenRequired": false,
-          "body": { "email": "string" },
+          "body": { "email": "string"},
           "responses": [
             {
               "code": 200,
@@ -93,7 +99,7 @@
               "code": 400,
               "response": {
                 "code": 400,
-                "message": "Invalid email / domain cannot receive mail / domain is not allowed / service domain"
+                "message": "Invalid email address, or the email domain cannot receive mail, is not allowed, or is the service domain"
               }
             },
             {
@@ -124,6 +130,12 @@
               "label": "Token",
               "name": "token",
               "type": "string",
+              "required": true
+            },
+            {
+              "label": "Tracker pixel consent",
+              "name": "trackerPixelConsent",
+              "type": "boolean",
               "required": true
             }
           ],
@@ -177,7 +189,7 @@
               "code": 400,
               "response": {
                 "code": 400,
-                "message": "Invalid email address"
+                "message": "Invalid email address, or the email domain cannot receive mail, is not allowed, or is the service domain"
               }
             },
             401,
@@ -260,7 +272,7 @@
         },
         {
           "name": "TOTP login",
-          "description": "Validates the 6-digit TOTP code and returns a JWT token to use in the Authorization header of authenticated requests.",
+          "description": "Validates the 6-digit TOTP code and returns an access token (SESSION, valid 30 min) and a refresh token (REFRESH, valid 30 days) to use in the Authorization header of authenticated requests.",
           "uri": "/login/totp",
           "method": "POST",
           "tokenRequired": false,
@@ -270,7 +282,8 @@
               "code": 200,
               "response": {
                 "message": "Successfully logged in",
-                "token": "string"
+                "token": "string",
+                "refresh_token": "string"
               }
             },
             {
@@ -296,6 +309,38 @@
             },
             500
           ]
+        },
+        {
+          "name": "refresh token",
+          "description": "Exchanges a valid, non-expired refresh token for a new access token (SESSION, valid 30 min). The refresh token is rotated: a new refresh token (REFRESH, valid 30 days) is returned and supersedes the one just consumed.",
+          "uri": "/refresh",
+          "method": "POST",
+          "tokenRequired": false,
+          "body": { "refresh_token": "string" },
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "token": "string",
+                "refresh_token": "string"
+              }
+            },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "Invalid or expired refresh token"
+              }
+            },
+            {
+              "code": 401,
+              "response": {
+                "code": 401,
+                "message": "User not found"
+              }
+            },
+            500
+          ]
         }
       ]
     },
@@ -304,7 +349,7 @@
         "singular": "media",
         "plural": "medias"
       },
-      "description": "Media files (images) uploaded and automatically converted to WebP. Accessible at /uploads/media/{uuid}/image.webp.",
+      "description": "Media files (images) uploaded and automatically converted to WebP, stored on Vercel Blob. Upload is asynchronous: POST replies 202 and the url appears once the background conversion finishes.",
       "uri": "/media",
       "uriParameters": [
         {
@@ -355,13 +400,13 @@
       ],
       "endpoints": {
         "GET-list": {
-          "description": "Returns the paginated list of media files."
+          "description": "Returns the list of media files. Pass ?url=<full-size url> to resolve a single media from the URL embedded in authored markdown — the response keeps the list envelope, with count 0 or 1."
         },
         "GET-single": {
           "description": "Returns a media file by its ID."
         },
         "POST": {
-          "description": "Uploads an image. The file is automatically converted to WebP.",
+          "description": "Uploads an image (max 5MB; the type is detected from the file contents, not the declared one). Replies 202 with only the created id: conversion to WebP (1200px plus a 300px thumbnail) and storage upload happen on a background thread. Poll GET /media/{id} until url is filled in — a 404 there means the conversion failed and the record was removed.",
           "includedErrors": [401, 500],
           "body": {
             "multipart": true,
@@ -429,7 +474,7 @@
           ]
         },
         "DELETE": {
-          "description": "Deletes a media file. Fails if the file is still referenced by an issue.",
+          "description": "Deletes a media file and its stored objects. Fails with 409 while the file is still referenced — by an issue cover, a user picture, or an image link inside a section's or an article's markdown. Replacing an issue cover or a user picture deletes the previous media automatically, so this endpoint is only needed for images dropped from markdown.",
           "responses": [
             {
               "code": 200,
@@ -524,6 +569,119 @@
           ]
         }
       ],
+      "customEndpoints": [
+        {
+          "name": "Get current user",
+          "description": "Returns the current user based on its session JWT auth token",
+          "uri": "/current",
+          "method": "GET",
+          "tokenRequired": true,
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "id": "integer",
+                "username": "string?",
+                "email": "string",
+                "role": "USER | AUTHOR",
+                "link": "string?",
+                "picture": "foreignKey-media",
+                "subscribedAt": "timestamp?",
+                "isSupporter": "boolean",
+                "createdAt": "timestamp",
+                "isEmailFlagged": "boolean",
+                "emailFlagReason": "string?"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get subscriber count",
+          "description": "Returns the number of subscribers of the newsletter",
+          "uri": "/nb-subscribers",
+          "method": "GET",
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "count": "integer"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get user count",
+          "description": "Returns the total number of users. Use the optional `type` parameter to restrict the count to subscribers (users with a non-null subscribedAt) or authors (role = AUTHOR).",
+          "uri": "/count",
+          "method": "GET",
+          "tokenRequired": true,
+          "queryParameters": [
+            {
+              "label": "Type",
+              "name": "type",
+              "type": "select",
+              "required": false,
+              "options": [
+                { "name": "subscriber", "label": "Subscribers" },
+                { "name": "author", "label": "Authors" }
+              ]
+            }
+          ],
+          "responses": [
+            {
+              "code": 200,
+              "response": { "count": "integer" }
+            },
+            401,
+            {
+              "code": 400,
+              "response": { "code": 400, "message": "Invalid type parameter" }
+            },
+            500
+          ]
+        },
+        {
+          "name": "Flag email",
+          "description": "Flags or unflags the email of a user by hand. A flagged user does not receive the newsletter. Requires AUTHOR authentication.",
+          "uri": "/{ID}/flag",
+          "method": "PUT",
+          "tokenRequired": true,
+          "uriParameters": [
+            {
+              "name": "id",
+              "type": "integer",
+              "defaultValue": 1,
+              "isPrimary": true
+            }
+          ],
+          "body": {
+            "schema": {
+              "flagged": "integer",
+              "reason": "string?"
+            },
+            "defaultValue": "{\n\t\"flagged\": 1,\n\t\"reason\": \"manual_override\"\n}"
+          },
+          "responses": [
+            {
+              "code": 200,
+              "response": { "message": "User flag successfully updated" }
+            },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "The flagged field is required: 0 or 1."
+              }
+            },
+            401,
+            {
+              "code": 404,
+              "response": { "code": 404, "message": "Not found" }
+            },
+            500
+          ]
+        }
+      ],
       "endpoints": {
         "GET-list": {
           "description": "Returns the paginated list of users. The totpSeed field is never exposed."
@@ -570,7 +728,7 @@
           ]
         },
         "PUT": {
-          "description": "Updates an existing user. If the email domain fails DNS or is on the blocklist (in flag mode), the user is accepted but isEmailFlagged is set.",
+          "description": "Updates an existing user. When the body has an email, its domain must be accepted (see the blocklist), and the flag of the user follows it: a blocked domain in flag mode sets isEmailFlagged, a flag set by an author is never changed.",
           "body": {
             "schema": {
               "username": "string?",
@@ -603,7 +761,7 @@
               "code": 400,
               "response": {
                 "code": 400,
-                "message": "Email domain cannot receive mail / is not allowed / is the service domain"
+                "message": "Email is not valid, domain cannot receive mail, domain is not allowed, or it is the service domain"
               }
             },
             {
@@ -618,44 +776,7 @@
         "DELETE": {
           "description": "Deletes a user. IssueAuthor associations are deleted in cascade."
         }
-      },
-      "customEndpoints": [
-        {
-          "name": "flag email",
-          "description": "Manually flags or unflags a user's email domain. Useful to override the automatic blocklist decision or to mark a suspicious address. Requires AUTHOR authentication.",
-          "uri": "/{ID}/flag",
-          "method": "PUT",
-          "tokenRequired": true,
-          "uriParameters": [
-            {
-              "name": "id",
-              "type": "integer",
-              "defaultValue": 1,
-              "isPrimary": true
-            }
-          ],
-          "body": {
-            "schema": {
-              "flagged": "boolean",
-              "reason": "string?"
-            },
-            "defaultValue": "{\n\t\"flagged\": 1,\n\t\"reason\": \"manual_override\"\n}"
-          },
-          "responses": [
-            {
-              "code": 200,
-              "response": { "message": "User flag successfully updated" }
-            },
-            400,
-            401,
-            {
-              "code": 404,
-              "response": { "code": 404, "message": "User not found" }
-            },
-            500
-          ]
-        }
-      ]
+      }
     },
     {
       "name": {
@@ -676,7 +797,13 @@
         "name": "string",
         "color": "string"
       },
-      "includedEndpoints": ["GET-list", "GET-single", "POST", "PUT", "DELETE"],
+      "includedEndpoints": [
+        "GET-list",
+        "GET-single",
+        "POST",
+        "PUT",
+        "DELETE"
+      ],
       "endpoints": {
         "GET-list": {
           "description": "Returns all available tags."
@@ -724,6 +851,77 @@
     },
     {
       "name": {
+        "singular": "category",
+        "plural": "categories"
+      },
+      "description": "Reusable content categories used to structure an issue (e.g. 'Breaking News', 'News'). Identified by their name (primary key). Distinct from Tag: a category structures the content of an issue into sections, a tag classifies the issue itself.",
+      "uri": "/category",
+      "uriParameters": [
+        {
+          "name": "name",
+          "type": "string",
+          "defaultValue": "Breaking News",
+          "isPrimary": true
+        }
+      ],
+      "schema": {
+        "name": "string",
+        "color": "string"
+      },
+      "includedEndpoints": [
+        "GET-list",
+        "GET-single",
+        "POST",
+        "PUT",
+        "DELETE"
+      ],
+      "endpoints": {
+        "GET-list": {
+          "description": "Returns all available categories."
+        },
+        "GET-single": {
+          "description": "Returns a category by its name."
+        },
+        "POST": {
+          "description": "Creates a new category. The name is the primary key (max 64 characters) and cannot be changed after creation.",
+          "body": {
+            "schema": { "name": "string", "color": "string" },
+            "defaultValue": "{\n\t\"name\": \"Breaking News\",\n\t\"color\": \"#a8192e\"\n}"
+          },
+          "responses": [
+            {
+              "code": 201,
+              "response": { "name": "string", "color": "string" }
+            },
+            {
+              "code": 409,
+              "response": {
+                "code": 409,
+                "message": "Category already exists"
+              }
+            }
+          ]
+        },
+        "PUT": {
+          "description": "Updates the color of an existing category.",
+          "body": {
+            "schema": { "color": "string" },
+            "defaultValue": "{\n\t\"color\": \"#123456\"\n}"
+          },
+          "responses": [
+            {
+              "code": 200,
+              "response": { "name": "string", "color": "string" }
+            }
+          ]
+        },
+        "DELETE": {
+          "description": "Deletes a category. IssueSection rows referencing it (and their articles) are deleted in cascade."
+        }
+      }
+    },
+    {
+      "name": {
         "singular": "sponsor",
         "plural": "sponsors"
       },
@@ -741,7 +939,13 @@
         "name": "string",
         "link": "string"
       },
-      "includedEndpoints": ["GET-list", "GET-single", "POST", "PUT", "DELETE"],
+      "includedEndpoints": [
+        "GET-list",
+        "GET-single",
+        "POST",
+        "PUT",
+        "DELETE"
+      ],
       "endpoints": {
         "GET-list": {
           "description": "Returns all sponsors."
@@ -789,10 +993,224 @@
     },
     {
       "name": {
+        "singular": "feed",
+        "plural": "feeds"
+      },
+      "description": "External feeds (e.g. RSS sources or curated link feeds) that can be categorized with tags. Listing is public; creating, editing and deleting require authentication.",
+      "uri": "/feed",
+      "uriParameters": [
+        {
+          "name": "id",
+          "type": "integer",
+          "defaultValue": 1,
+          "isPrimary": true
+        }
+      ],
+      "schema": {
+        "id": "integer",
+        "name": "string",
+        "link": "string",
+        "isRssFeed": "boolean"
+      },
+      "response": {
+        "get-list": {
+          "data": "array-feed",
+          "total": "integer",
+          "page": "integer",
+          "pageSize": "integer"
+        },
+        "get-single": {
+          "id": "integer",
+          "name": "string",
+          "link": "string",
+          "isRssFeed": "boolean"
+        }
+      },
+      "listParameters": [
+        {
+          "name": "page",
+          "label": "Page",
+          "type": "integer",
+          "defaultValue": 1,
+          "min": 1
+        },
+        {
+          "name": "limit",
+          "label": "Limit",
+          "type": "integer",
+          "defaultValue": 20,
+          "min": 1,
+          "max": 100
+        },
+        {
+          "name": "q",
+          "label": "Search",
+          "type": "string"
+        },
+        {
+          "name": "sort",
+          "label": "Sort",
+          "type": "select",
+          "options": [
+            { "name": "asc", "label": "Ascending" },
+            { "name": "desc", "label": "Descending" }
+          ]
+        }
+      ],
+      "includedEndpoints": [
+        "GET-list",
+        "GET-single",
+        "POST",
+        "PUT",
+        "DELETE"
+      ],
+      "endpoints": {
+        "GET-list": {
+          "description": "Returns the paginated list of feeds. Public, no authentication required."
+        },
+        "GET-single": {
+          "description": "Returns a feed by its ID. Public, no authentication required."
+        },
+        "POST": {
+          "description": "Creates a new feed. Requires authentication.",
+          "body": {
+            "schema": {
+              "name": "string",
+              "link": "string",
+              "isRssFeed": "boolean?"
+            },
+            "defaultValue": "{\n\t\"name\": \"Date.now() blog\",\n\t\"link\": \"https://datenow.dev/feed.xml\",\n\t\"isRssFeed\": true\n}"
+          },
+          "responses": [
+            {
+              "code": 201,
+              "response": {
+                "id": "integer",
+                "name": "string",
+                "link": "string",
+                "isRssFeed": "boolean"
+              }
+            }
+          ]
+        },
+        "PUT": {
+          "description": "Updates an existing feed. Requires authentication.",
+          "body": {
+            "schema": {
+              "name": "string",
+              "link": "string",
+              "isRssFeed": "boolean?"
+            },
+            "defaultValue": "{\n\t\"name\": \"Date.now() blog\",\n\t\"link\": \"https://datenow.dev/feed.xml\",\n\t\"isRssFeed\": true\n}"
+          },
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "id": "integer",
+                "name": "string",
+                "link": "string",
+                "isRssFeed": "boolean"
+              }
+            }
+          ]
+        },
+        "DELETE": {
+          "description": "Deletes a feed. Requires authentication. FeedTag associations are deleted in cascade."
+        }
+      }
+    },
+    {
+      "name": {
+        "singular": "feed tag",
+        "plural": "feed tags"
+      },
+      "description": "Association between a feed and a tag (FeedTag table). URI: /feed/{id}/tag. Deletions are cascaded. Listing is public; creating and deleting require authentication.",
+      "uri": "/feed/{ID}/tag",
+      "uriParameters": [
+        {
+          "name": "tagName",
+          "type": "string",
+          "defaultValue": "Software",
+          "isPrimary": true
+        },
+        { "name": "id", "type": "integer", "defaultValue": 1 }
+      ],
+      "schema": {
+        "tagName": "string",
+        "feedId": "integer"
+      },
+      "includedEndpoints": ["GET-list", "POST", "DELETE"],
+      "endpoints": {
+        "GET-list": {
+          "description": "Returns all tags associated with the feed. Public, no authentication required.",
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "data": [{ "name": "string", "color": "string" }]
+              }
+            },
+            {
+              "code": 404,
+              "response": {
+                "code": 404,
+                "message": "Feed not found"
+              }
+            }
+          ]
+        },
+        "POST": {
+          "description": "Associates an existing tag with the feed. Requires authentication.",
+          "responses": [
+            {
+              "code": 201,
+              "response": {
+                "message": "Feed tag successfully created"
+              }
+            },
+            {
+              "code": 404,
+              "response": {
+                "code": 404,
+                "message": "Feed or tag not found"
+              }
+            },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "The tag already exists"
+              }
+            }
+          ]
+        },
+        "DELETE": {
+          "description": "Removes a tag from the feed. Requires authentication.",
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "message": "Feed tag successfully deleted"
+              }
+            },
+            {
+              "code": 404,
+              "response": {
+                "code": 404,
+                "message": "Feed, tag or association not found"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": {
         "singular": "issue",
         "plural": "issues"
       },
-      "description": "Newsletter issues — drafts, published, and archived. Each issue has rich content, a cover image, authors, tags, and sponsors.",
+      "description": "Newsletter issues — drafts, published, and archived. Each issue has a cover image, authors, tags, sponsors, and a structured content tree of sections (categories of curated articles, or freestanding text blocks).",
       "uri": "/issue",
       "uriParameters": [
         {
@@ -813,12 +1231,18 @@
         "updatedAt": "timestamp?",
         "issueNumber": "integer",
         "excerpt": "string",
-        "content": "string",
         "isSponsored": "boolean",
         "status": "DRAFT | PUBLISHED | ARCHIVE",
-        "openedMailCount": "integer"
+        "openedMailCount": "integer",
+        "vodUrl": "string?"
       },
-      "includedEndpoints": ["GET-list", "GET-single", "POST", "PUT", "DELETE"],
+      "includedEndpoints": [
+        "GET-list",
+        "GET-single",
+        "POST",
+        "PUT",
+        "DELETE"
+      ],
       "response": {
         "get-list": {
           "data": "array-issue",
@@ -837,14 +1261,15 @@
           "updatedAt": "timestamp?",
           "issueNumber": "integer",
           "excerpt": "string",
-          "content": "string",
           "isSponsored": "boolean",
           "status": "DRAFT | PUBLISHED | ARCHIVE",
           "openedMailCount": "integer",
+          "vodUrl": "string?",
           "views": "integer",
           "authors": "array-user",
           "tags": "array-tag",
-          "sponsors": "array-sponsor"
+          "sponsors": "array-sponsor",
+          "sections": "array-issue section"
         }
       },
       "listParameters": [
@@ -868,6 +1293,7 @@
           "label": "Status",
           "type": "select",
           "options": [
+            { "name": "null", "label": "All" },
             { "name": "DRAFT", "label": "Draft" },
             { "name": "PUBLISHED", "label": "Published" },
             { "name": "ARCHIVE", "label": "Archived" }
@@ -876,13 +1302,13 @@
       ],
       "endpoints": {
         "GET-list": {
-          "description": "Returns the paginated list of issues, optionally filtered by status."
+          "description": "Returns the paginated list of issues, optionally filtered by status. Without authentication only PUBLISHED issues are returned, whatever the status parameter asks for."
         },
         "GET-single": {
-          "description": "Returns an issue by its ID, including its authors, tags, and sponsors."
+          "description": "Returns an issue by its ID, including its authors, tags, and sponsors. An issue that is not PUBLISHED returns 404 unless the caller is an authenticated author or passes a valid ?preview= token for that issue."
         },
         "POST": {
-          "description": "Creates a new issue. The slug is auto-generated from the title if not provided. The issue number must be unique.",
+          "description": "Creates a new issue. The slug is auto-generated from the title if not provided. The issue number must be unique. Content is managed afterwards via /issue/{id}/section and /issue/{id}/section/{sectionId}/article.",
           "body": {
             "schema": {
               "slug": "string?",
@@ -890,12 +1316,12 @@
               "subtitle": "string",
               "issueNumber": "integer",
               "excerpt": "string",
-              "content": "string",
               "isSponsored": "boolean?",
               "status": "DRAFT | PUBLISHED | ARCHIVE",
-              "cover": "integer?"
+              "cover": "integer?",
+              "vodUrl": "string?"
             },
-            "defaultValue": "{\n\t\"title\": \"My first issue\",\n\t\"subtitle\": \"A great subtitle\",\n\t\"issueNumber\": 1,\n\t\"excerpt\": \"A short excerpt\",\n\t\"content\": \"Full content here\",\n\t\"status\": \"DRAFT\"\n}"
+            "defaultValue": "{\n\t\"title\": \"My first issue\",\n\t\"subtitle\": \"A great subtitle\",\n\t\"issueNumber\": 1,\n\t\"excerpt\": \"A short excerpt\",\n\t\"status\": \"DRAFT\"\n}"
           },
           "responses": [
             {
@@ -909,10 +1335,10 @@
                 "createdAt": "timestamp",
                 "issueNumber": "integer",
                 "excerpt": "string",
-                "content": "string",
                 "isSponsored": "boolean",
                 "status": "DRAFT | PUBLISHED | ARCHIVE",
-                "openedMailCount": "integer"
+                "openedMailCount": "integer",
+                "vodUrl": "string?"
               }
             },
             {
@@ -925,7 +1351,7 @@
           ]
         },
         "PUT": {
-          "description": "Updates an existing issue. All fields are required.",
+          "description": "Updates an existing issue. All fields are required. Content sections are managed separately via /issue/{id}/section.",
           "body": {
             "schema": {
               "slug": "string?",
@@ -933,12 +1359,12 @@
               "subtitle": "string",
               "issueNumber": "integer",
               "excerpt": "string",
-              "content": "string",
               "isSponsored": "boolean?",
               "status": "DRAFT | PUBLISHED | ARCHIVE",
-              "cover": "integer?"
+              "cover": "integer?",
+              "vodUrl": "string?"
             },
-            "defaultValue": "{\n\t\"title\": \"My first issue\",\n\t\"subtitle\": \"A great subtitle\",\n\t\"issueNumber\": 1,\n\t\"excerpt\": \"A short excerpt\",\n\t\"content\": \"Full content here\",\n\t\"status\": \"DRAFT\"\n}"
+            "defaultValue": "{\n\t\"title\": \"My first issue\",\n\t\"subtitle\": \"A great subtitle\",\n\t\"issueNumber\": 1,\n\t\"excerpt\": \"A short excerpt\",\n\t\"status\": \"DRAFT\"\n}"
           },
           "responses": [
             {
@@ -954,10 +1380,10 @@
                 "updatedAt": "timestamp?",
                 "issueNumber": "integer",
                 "excerpt": "string",
-                "content": "string",
                 "isSponsored": "boolean",
                 "status": "DRAFT | PUBLISHED | ARCHIVE",
-                "openedMailCount": "integer"
+                "openedMailCount": "integer",
+                "vodUrl": "string?"
               }
             },
             {
@@ -974,6 +1400,124 @@
         }
       },
       "customEndpoints": [
+        {
+          "name": "Create preview token",
+          "description": "Issues a short-lived token granting read access to this single issue even when it is not published, so it can be previewed on the front-end. The token is a JWT valid for 30 minutes and scoped to this issue only — it never unlocks another one. Pass it as the ?preview= query parameter on GET /issue/{id} or GET /issue/slug/{slug}. Requires authentication. It cannot be revoked before it expires.",
+          "uri": "/{id}/preview",
+          "method": "POST",
+          "tokenRequired": true,
+          "uriParameters": [
+            {
+              "name": "id",
+              "type": "integer",
+              "defaultValue": "1",
+              "isPrimary": true
+            }
+          ],
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "token": "string",
+                "expiresAt": "timestamp"
+              }
+            },
+            {
+              "code": 401,
+              "response": {
+                "code": 401,
+                "message": "Unauthorized"
+              }
+            },
+            {
+              "code": 404,
+              "response": {
+                "code": 404,
+                "message": "Issue not found"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get issue by slug",
+          "description": "Returns the full issue object (with authors, tags, sponsors, and content sections) by its slug instead of its numeric id. Public for PUBLISHED issues; a draft or archived issue returns 404 unless the caller is an authenticated author or passes a valid ?preview= token for that issue. Preview responses are sent with Cache-Control: no-store.",
+          "uri": "/slug/{slug}",
+          "method": "GET",
+          "tokenRequired": false,
+          "uriParameters": [
+            {
+              "name": "slug",
+              "type": "string",
+              "defaultValue": "my-first-issue",
+              "isPrimary": true
+            }
+          ],
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "id": "integer",
+                "slug": "string",
+                "title": "string",
+                "subtitle": "string",
+                "cover": "foreignKey-media",
+                "createdAt": "timestamp",
+                "publishedAt": "timestamp?",
+                "updatedAt": "timestamp?",
+                "issueNumber": "integer",
+                "excerpt": "string",
+                "isSponsored": "boolean",
+                "status": "DRAFT | PUBLISHED | ARCHIVE",
+                "openedMailCount": "integer",
+                "vodUrl": "string?",
+                "views": "integer",
+                "authors": "array-user",
+                "tags": "array-tag",
+                "sponsors": "array-sponsor",
+                "sections": "array-issue section"
+              }
+            },
+            {
+              "code": 404,
+              "response": {
+                "code": 404,
+                "message": "Issue not found"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get issue count",
+          "description": "Returns the total number of issues. Use the optional `status` parameter to restrict the count to issues with a specific status.",
+          "uri": "/count",
+          "method": "GET",
+          "tokenRequired": true,
+          "queryParameters": [
+            {
+              "label": "Status",
+              "name": "status",
+              "type": "select",
+              "required": false,
+              "options": [
+                { "name": "DRAFT", "label": "Draft" },
+                { "name": "PUBLISHED", "label": "Published" },
+                { "name": "ARCHIVE", "label": "Archived" }
+              ]
+            }
+          ],
+          "responses": [
+            {
+              "code": 200,
+              "response": { "count": "integer" }
+            },
+            401,
+            {
+              "code": 400,
+              "response": { "code": 400, "message": "Invalid status parameter" }
+            },
+            500
+          ]
+        },
         {
           "name": "publish",
           "description": "Publishes an issue and sends the newsletter to active subscribers. Sets status to PUBLISHED and records publishedAt.",
@@ -1012,6 +1556,266 @@
               }
             },
             500
+          ]
+        }
+      ]
+    },
+    {
+      "name": {
+        "singular": "issue section",
+        "plural": "issue sections"
+      },
+      "description": "An ordered content section of an issue: either a category of curated articles, or a freestanding rich-text block. URI: /issue/{id}/section. Deletions are cascaded (including its articles). Positions are managed via append-on-create plus a dedicated /reorder endpoint — PUT never changes position or type.",
+      "uri": "/issue/{ID}/section",
+      "uriParameters": [
+        {
+          "name": "sectionId",
+          "type": "integer",
+          "defaultValue": 1,
+          "isPrimary": true
+        },
+        { "name": "id", "type": "integer", "defaultValue": 1 }
+      ],
+      "schema": {
+        "id": "integer",
+        "issueId": "integer",
+        "position": "integer",
+        "type": "CATEGORY | TEXT",
+        "categoryName": "string?",
+        "textBody": "string?",
+        "articles": "array-article"
+      },
+      "includedEndpoints": ["GET-list", "GET-single", "POST", "PUT", "DELETE"],
+      "endpoints": {
+        "GET-list": {
+          "description": "Returns all sections of the issue, ordered by position, each including its articles when type is CATEGORY. Public, no authentication required."
+        },
+        "GET-single": {
+          "description": "Returns a section by its id, including its articles when type is CATEGORY. Public, no authentication required."
+        },
+        "POST": {
+          "description": "Creates a new section, appended at the end of the issue (position is server-assigned). Body must set exactly one of categoryName (type CATEGORY, category must already exist) or textBody (type TEXT, a markdown string). Requires authentication.",
+          "body": {
+            "schema": {
+              "type": "CATEGORY | TEXT",
+              "categoryName": "string?",
+              "textBody": "string?"
+            },
+            "defaultValue": "{\n\t\"type\": \"TEXT\",\n\t\"textBody\": \"Some **bold** intro text.\"\n}"
+          },
+          "responses": [
+            {
+              "code": 201,
+              "response": {
+                "id": "integer",
+                "issueId": "integer",
+                "position": "integer",
+                "type": "CATEGORY | TEXT",
+                "categoryName": "string?",
+                "textBody": "string?",
+                "articles": "array-article"
+              }
+            },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "categoryName must be set (and textBody omitted) for CATEGORY sections; textBody must be set (and categoryName omitted) for TEXT sections."
+              }
+            },
+            {
+              "code": 404,
+              "response": {
+                "code": 404,
+                "message": "Issue or category not found"
+              }
+            }
+          ]
+        },
+        "PUT": {
+          "description": "Updates categoryName (CATEGORY sections) or textBody (TEXT sections) — matching the section's existing type. Never changes type or position. Requires authentication.",
+          "body": {
+            "schema": {
+              "categoryName": "string?",
+              "textBody": "string?"
+            }
+          },
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "id": "integer",
+                "issueId": "integer",
+                "position": "integer",
+                "type": "CATEGORY | TEXT",
+                "categoryName": "string?",
+                "textBody": "string?",
+                "articles": "array-article"
+              }
+            }
+          ]
+        },
+        "DELETE": {
+          "description": "Deletes a section. Its articles are deleted in cascade."
+        }
+      },
+      "customEndpoints": [
+        {
+          "name": "Reorder sections",
+          "description": "Rewrites the position of every section of the issue to its index in the given order array. The array must contain exactly the ids currently belonging to the issue.",
+          "uri": "/reorder",
+          "method": "PUT",
+          "tokenRequired": true,
+          "body": { "order": "integer[]" },
+          "responses": [
+            {
+              "code": 200,
+              "response": { "message": "Sections successfully reordered" }
+            },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "The 'order' array must contain exactly the ids currently in this collection."
+              }
+            },
+            401,
+            {
+              "code": 404,
+              "response": { "code": 404, "message": "Issue not found" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": {
+        "singular": "article",
+        "plural": "articles"
+      },
+      "description": "A curated article within an issue's CATEGORY section: a title, a source (link + blog/media name), and a markdown summary (embeds use a ::platform[url] syntax — youtube, instagram, bluesky, mastodon, tweet — resolved by the renderers, not by the API). URI: /issue/{id}/section/{sectionId}/article. Positions are managed via append-on-create plus a dedicated /reorder endpoint — PUT never changes position.",
+      "uri": "/issue/{ID}/section/{sectionId}/article",
+      "uriParameters": [
+        {
+          "name": "articleId",
+          "type": "integer",
+          "defaultValue": 1,
+          "isPrimary": true
+        },
+        { "name": "id", "type": "integer", "defaultValue": 1 },
+        { "name": "sectionId", "type": "integer", "defaultValue": 1 }
+      ],
+      "schema": {
+        "id": "integer",
+        "sectionId": "integer",
+        "position": "integer",
+        "title": "string",
+        "sourceName": "string",
+        "sourceUrl": "string",
+        "summary": "string"
+      },
+      "includedEndpoints": ["GET-list", "GET-single", "POST", "PUT", "DELETE"],
+      "endpoints": {
+        "GET-list": {
+          "description": "Returns all articles of the section, ordered by position. Public, no authentication required. 404 if the section isn't a CATEGORY section."
+        },
+        "GET-single": {
+          "description": "Returns an article by its id. Public, no authentication required."
+        },
+        "POST": {
+          "description": "Creates a new article, appended at the end of the section (position is server-assigned). summary must be a markdown string. Requires authentication.",
+          "body": {
+            "schema": {
+              "title": "string",
+              "sourceName": "string",
+              "sourceUrl": "string",
+              "summary": "string"
+            },
+            "defaultValue": "{\n\t\"title\": \"A breaking headline\",\n\t\"sourceName\": \"Le Monde\",\n\t\"sourceUrl\": \"https://lemonde.fr/article\",\n\t\"summary\": \"A **bold** summary.\\n\\n::youtube[https://youtu.be/xxxx]\"\n}"
+          },
+          "responses": [
+            {
+              "code": 201,
+              "response": {
+                "id": "integer",
+                "sectionId": "integer",
+                "position": "integer",
+                "title": "string",
+                "sourceName": "string",
+                "sourceUrl": "string",
+                "summary": "string"
+              }
+            },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "summary must be a string of markdown."
+              }
+            },
+            {
+              "code": 404,
+              "response": {
+                "code": 404,
+                "message": "Issue or section not found"
+              }
+            }
+          ]
+        },
+        "PUT": {
+          "description": "Updates title, sourceName, sourceUrl and/or summary. Never changes position. Requires authentication.",
+          "body": {
+            "schema": {
+              "title": "string",
+              "sourceName": "string",
+              "sourceUrl": "string",
+              "summary": "string"
+            }
+          },
+          "responses": [
+            {
+              "code": 200,
+              "response": {
+                "id": "integer",
+                "sectionId": "integer",
+                "position": "integer",
+                "title": "string",
+                "sourceName": "string",
+                "sourceUrl": "string",
+                "summary": "string"
+              }
+            }
+          ]
+        },
+        "DELETE": {
+          "description": "Deletes an article."
+        }
+      },
+      "customEndpoints": [
+        {
+          "name": "Reorder articles",
+          "description": "Rewrites the position of every article of the section to its index in the given order array. The array must contain exactly the ids currently belonging to the section.",
+          "uri": "/reorder",
+          "method": "PUT",
+          "tokenRequired": true,
+          "body": { "order": "integer[]" },
+          "responses": [
+            {
+              "code": 200,
+              "response": { "message": "Articles successfully reordered" }
+            },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "The 'order' array must contain exactly the ids currently in this collection."
+              }
+            },
+            401,
+            {
+              "code": 404,
+              "response": { "code": 404, "message": "Issue or section not found" }
+            }
           ]
         }
       ]
@@ -1304,7 +2108,7 @@
         "singular": "blocked email domain",
         "plural": "blocked email domains"
       },
-      "description": "Domains that are blocked from subscribing or registering (disposable mail providers, etc.). GET visibility is controlled by the BLOCKED_DOMAIN_LIST_PUBLIC environment variable.",
+      "description": "Disposable email domains that cannot subscribe or register. An email whose domain is blocked is refused, or accepted and flagged when EMAIL_BLOCKLIST_MODE is `flag`. The list is public when BLOCKED_DOMAIN_LIST_PUBLIC is `1`.",
       "uri": "/blocked-domain",
       "uriParameters": [
         {
@@ -1320,8 +2124,8 @@
       "includedEndpoints": [],
       "customEndpoints": [
         {
-          "name": "list blocked domains",
-          "description": "Returns the full list of blocked email domains as a JSON array of strings. Public when BLOCKED_DOMAIN_LIST_PUBLIC=1, otherwise requires AUTHOR authentication.",
+          "name": "List blocked domains",
+          "description": "Returns every blocked domain, in alphabetical order, as a JSON array of strings. Public when BLOCKED_DOMAIN_LIST_PUBLIC is `1`, otherwise it requires AUTHOR authentication.",
           "uri": "",
           "method": "GET",
           "tokenRequired": false,
@@ -1335,8 +2139,8 @@
           ]
         },
         {
-          "name": "add blocked domain",
-          "description": "Adds a domain to the blocklist. Requires AUTHOR authentication.",
+          "name": "Block a domain",
+          "description": "Adds a domain to the blocklist. The domain is written in lowercase, without a trailing dot. Requires AUTHOR authentication.",
           "uri": "",
           "method": "POST",
           "tokenRequired": true,
@@ -1349,7 +2153,13 @@
               "code": 201,
               "response": { "message": "Domain successfully blocked" }
             },
-            400,
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "The domain is not a valid domain name."
+              }
+            },
             401,
             {
               "code": 409,
@@ -1359,8 +2169,8 @@
           ]
         },
         {
-          "name": "remove blocked domain",
-          "description": "Removes a domain from the blocklist. Requires AUTHOR authentication.",
+          "name": "Unblock a domain",
+          "description": "Removes a domain from the blocklist. The case of the domain does not matter. Requires AUTHOR authentication.",
           "uri": "/{domain}",
           "method": "DELETE",
           "tokenRequired": true,
@@ -1377,10 +2187,17 @@
               "code": 200,
               "response": { "message": "Domain successfully unblocked" }
             },
+            {
+              "code": 400,
+              "response": {
+                "code": 400,
+                "message": "The domain is not a valid domain name."
+              }
+            },
             401,
             {
               "code": 404,
-              "response": { "code": 404, "message": "Domain not found in blocklist" }
+              "response": { "code": 404, "message": "Not found" }
             },
             500
           ]
@@ -1409,7 +2226,7 @@
         "issueId": "integer"
       },
       "includedEndpoints": ["GET-list", "POST"],
-      "tokenRequired": { "GET-list": true, "post": false },
+      "tokenRequired": { "post": false },
       "listParameters": [
         {
           "name": "page",
@@ -1434,7 +2251,7 @@
       ],
       "endpoints": {
         "GET-list": {
-          "description": "Returns the paginated list of views, optionally filtered by issue.",
+          "description": "Returns the paginated list of views, optionally filtered by issue. Requires authentication.",
           "responses": [
             {
               "code": 200,

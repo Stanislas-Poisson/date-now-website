@@ -1,9 +1,10 @@
 <script lang="ts">
-	import { format } from 'date-fns';
+	import { format, fromUnixTime } from 'date-fns';
 	import type { Article } from '../../types';
 	import Card from './Card.svelte';
 	import Tag from './Tag.svelte';
 	import Button from './Button.svelte';
+	import { rgbOf } from '$lib/colors';
 
 	type ArticleSize = 'medium' | 'large';
 
@@ -28,29 +29,33 @@
 		{/if}
 
 		<p class="article-preview__metadata">
-			<Tag tag="span">Issue #{article.editionNumber}</Tag>
-			<span>{format(article.publishedDate, 'dd/MM/yyyy')}</span>
+			<Tag tag="span">Issue #{article.issueNumber}</Tag>
+			<span>{format(fromUnixTime(article.publishedAt), 'dd/MM/yyyy')}</span>
 		</p>
 
 		<ul class="article-preview__tags">
-			{#each article.tags as tag}
-				<Tag tag="li" --color={`${tag.color.r}, ${tag.color.g}, ${tag.color.b}`}>{tag.name}</Tag>
+			{#each article.tags as tag (tag.name)}
+				<Tag tag="li" --color={rgbOf(tag.color)}>{tag.name}</Tag>
 			{/each}
 		</ul>
 	</div>
 
 	<img
 		class="article-preview__cover"
-		src={article.coverURL || '/article-cover-placeholder.png'}
-		alt="Issue's cover"
+		src={article.cover?.thumbUrl || article.cover?.url || '/article-cover-placeholder.png'}
+		alt={article.cover?.alt || "Issue's cover"}
+		loading="lazy"
 	/>
 
 	<div class="article-preview__content">
 		<!-- EXCERPT -->
 		<p class="article-preview__excerpt">{article.excerpt}</p>
 
-		<Button --width="100%" customClass="article-preview__button" tag="a" href="/issue"
-			>Read more</Button
+		<Button
+			--width="100%"
+			customClass="article-preview__button"
+			tag="a"
+			href={`/issue/${article.slug}`}>Read more</Button
 		>
 	</div>
 </Card>

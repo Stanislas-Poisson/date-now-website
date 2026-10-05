@@ -1,16 +1,14 @@
 services:
   api:
-    build: .
+    build: 
+      context: .
+      target: dev
     ports:
       - "8000:8000"
-    environment:
-      - JWT_SECRET=${JWT_SECRET}
     env_file:
       - .env
     volumes:
       - ./data:/app/data
-      - ./uwu.db:/app/uwu.db
-      - uploads:/var/www/uploads
     cap_add:
       - SYS_PTRACE
     security_opt:
@@ -22,8 +20,4 @@ services:
           path: .
           target: .
           ignore:
-            - uwu.db
             - README.md
-
-volumes:
-  uploads:

@@ -20,7 +20,9 @@
  *   write buffer before returning.
  */
 
-extern char g_json_header[]; // défini dans main.c
+/** @brief Size of the shared response-header buffer. */
+#define JSON_HEADER_SIZE 512
+extern char g_json_header[JSON_HEADER_SIZE]; // défini dans main.c
 #define JSON_HEADER g_json_header
 
 /* Generic request errors */
@@ -52,6 +54,7 @@ extern char g_json_header[]; // défini dans main.c
 #define ISSUE_EXISTS_MESSAGE "The issue already exists."
 #define ISSUE_ALREADY_PUBLISHED_MESSAGE "Issue is already published."
 #define TITLE_REQUIRED_MESSAGE "Title is required."
+#define SLUG_REQUIRED_MESSAGE "Slug is required."
 #define ISSUE_NUMBER_REQUIRED_MESSAGE "Issue number is required."
 #define STATUS_FORMAT_MESSAGE                                                  \
   "Value of 'status' should be 'DRAFT', 'PUBLISHED' or 'ARCHIVE'."
@@ -62,6 +65,16 @@ extern char g_json_header[]; // défini dans main.c
 /* Tag endpoint messages */
 #define TAG_EXISTS_MESSAGE "The tag already exists."
 #define COLOR_REQUIRED_MESSAGE "The color is required."
+
+/* Email admission and blocked domain messages */
+#define EMAIL_DOMAIN_UNRESOLVABLE_MESSAGE "Email domain cannot receive mail."
+#define EMAIL_DOMAIN_BLOCKED_MESSAGE "Email domain is not allowed."
+#define EMAIL_DOMAIN_SELF_MESSAGE "Cannot register with the service domain."
+#define DOMAIN_REQUIRED_MESSAGE "The domain is required."
+#define DOMAIN_FORMAT_MESSAGE "The domain is not a valid domain name."
+#define DOMAIN_EXISTS_MESSAGE "The domain is already blocked."
+#define FLAG_REQUIRED_MESSAGE "The flagged field is required: 0 or 1."
+#define FLAG_REASON_MESSAGE "The reason must be at most 100 characters long."
 
 /* Sponsor endpoint messages */
 #define SPONSOR_EXISTS_MESSAGE "The sponsor already exists."
@@ -77,13 +90,31 @@ extern char g_json_header[]; // défini dans main.c
 #define HASHED_IP_REQUIRED_MESSAGE "The hashed IP is required."
 #define ISSUE_REQUIRED_MESSAGE "The issue ID is required."
 
-/* Email admission messages */
-#define EMAIL_DOMAIN_UNRESOLVABLE_MESSAGE "Email domain cannot receive mail."
-#define EMAIL_DOMAIN_BLOCKED_MESSAGE "Email domain is not allowed."
-#define EMAIL_DOMAIN_SELF_MESSAGE "Cannot register with the service domain."
-#define DOMAIN_REQUIRED_MESSAGE "The domain is required."
-#define DOMAIN_EXISTS_MESSAGE "The domain is already blocked."
-#define FLAG_REQUIRED_MESSAGE "The flagged field is required."
+/* Category endpoint messages */
+#define CATEGORY_EXISTS_MESSAGE "The category already exists."
+
+/* IssueSection / Article endpoint messages */
+#define TYPE_REQUIRED_MESSAGE "The type is required."
+#define TYPE_FORMAT_MESSAGE "Value of 'type' should be 'CATEGORY' or 'TEXT'."
+#define CATEGORY_NAME_REQUIRED_MESSAGE                                        \
+  "categoryName is required for CATEGORY sections."
+#define TEXT_BODY_REQUIRED_MESSAGE "textBody is required for TEXT sections."
+#define SECTION_TYPE_MISMATCH_MESSAGE                                         \
+  "categoryName must be set (and textBody omitted) for CATEGORY sections; "   \
+  "textBody must be set (and categoryName omitted) for TEXT sections."
+#define SOURCE_NAME_REQUIRED_MESSAGE "sourceName is required."
+#define SOURCE_URL_REQUIRED_MESSAGE "sourceUrl is required."
+#define SUMMARY_REQUIRED_MESSAGE "summary is required."
+#define TEXT_BODY_FORMAT_MESSAGE                                              \
+  "textBody must be a string of markdown."
+#define SUMMARY_FORMAT_MESSAGE "summary must be a string of markdown."
+/** @brief Lifetime of an issue preview token, in seconds. */
+#define PREVIEW_TOKEN_TTL 1800
+
+#define REORDER_REQUIRED_MESSAGE "The 'order' array is required."
+#define REORDER_MISMATCH_MESSAGE                                              \
+  "The 'order' array must contain exactly the ids currently in this "        \
+  "collection."
 
 /* -------------------------------------------------------------------------
  * Error reply macros
@@ -132,6 +163,25 @@ extern char g_json_header[]; // défini dans main.c
   mg_http_reply(c, error_reply->code_http, JSON_HEADER, error_reply->json);    \
   free(error_reply->json);                                                     \
   error_reply->json = NULL;
+
+/**
+ * @brief Reply with the error that matches a refused email admission
+ *        (see lib/email_admission.h): 400 for the email, 500 when the
+ *        blocklist cannot be read.
+ * @param reason_code EMAIL_ADMISSION_* constant of the refused email.
+ */
+#define ERROR_REPLY_EMAIL_ADMISSION(reason_code)                               \
+  if ((reason_code) == EMAIL_ADMISSION_ERROR) {                                \
+    ERROR_REPLY_500;                                                           \
+  } else if ((reason_code) == EMAIL_ADMISSION_MALFORMED) {                     \
+    ERROR_REPLY_400(EMAIL_VALIDITY_ERROR_MESSAGE);                             \
+  } else if ((reason_code) == EMAIL_ADMISSION_DNS_FAIL) {                      \
+    ERROR_REPLY_400(EMAIL_DOMAIN_UNRESOLVABLE_MESSAGE);                        \
+  } else if ((reason_code) == EMAIL_ADMISSION_APP_DOMAIN) {                    \
+    ERROR_REPLY_400(EMAIL_DOMAIN_SELF_MESSAGE);                                \
+  } else {                                                                     \
+    ERROR_REPLY_400(EMAIL_DOMAIN_BLOCKED_MESSAGE);                             \
+  }
 
 /** @brief Reply with HTTP 409 Conflict and the given @p message. */
 #define ERROR_REPLY_409(message)                                               \
@@ -229,7 +279,7 @@ extern char g_json_header[]; // défini dans main.c
  */
 #define REQUIRED_BODY_PROPERTY(prop, message)                                  \
   offset = mg_json_get(msg->body, "$." prop, &length);                         \
-  if (offset < 0) {                                                            \
+  if (offset < 0 || length - 2 <= 0) {                                         \
     ERROR_REPLY_400(message);                                                  \
     return;                                                                    \
   }

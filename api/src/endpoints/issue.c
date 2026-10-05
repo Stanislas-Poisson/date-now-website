@@ -4,7 +4,10 @@
  */
 
 #include <endpoints/auth.h>
+#include <endpoints/media.h>
+#include <cjson/cJSON.h>
 #include <enums.h>
+#include <jwt.h>
 #include <lib/email.h>
 #include <lib/mongoose.h>
 #include <lib/validatejson.h>
@@ -15,12 +18,82 @@
 #include <math.h>
 #include <pthread.h>
 #include <sql/issue.h>
+#include <sql/issue_author.h>
 #include <sql/user.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <structs.h>
 #include <utils.h>
+
+/**
+ * @brief Checks the "preview" query param against one issue.
+ *
+ * The token must be signed with @p secret, unexpired, of type PREVIEW, and
+ * carry an "issueId" claim matching @p issue_id — a token minted for one
+ * issue never unlocks another.
+ *
+ * @return 1 when the token grants access to @p issue_id, 0 otherwise.
+ */
+static int preview_token_valid(struct mg_http_message *msg, int issue_id,
+                               const char *secret) {
+  char token[2048] = "";
+  int len = mg_http_get_var(&msg->query, "preview", token, sizeof(token));
+  if (len <= 0) {
+    return 0;
+  }
+  token[len] = '\0';
+
+  jwt_t *decoded = NULL;
+  if (jwt_decode(&decoded, token, (unsigned char *)secret, strlen(secret)) !=
+      0) {
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("BAD PREVIEW TOKEN"));
+    return 0;
+  }
+
+  int valid = 1;
+
+  if (time(NULL) > jwt_get_grant_int(decoded, "exp")) {
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("PREVIEW TOKEN EXPIRED"));
+    valid = 0;
+  } else if (jwt_get_grant_int(decoded, "type") != PREVIEW) {
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("WRONG PREVIEW TOKEN TYPE"));
+    valid = 0;
+  } else if (jwt_get_grant_int(decoded, "issueId") != issue_id) {
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("PREVIEW TOKEN ISSUE MISMATCH"));
+    valid = 0;
+  }
+
+  jwt_free(decoded);
+  return valid;
+}
+
+/**
+ * @brief Whether the caller may read an issue that is not published.
+ *
+ * Either a preview token scoped to this issue, or a logged-in author.
+ */
+static int may_read_unpublished(struct mg_connection *c,
+                                struct mg_http_message *msg, int issue_id,
+                                struct error_reply *error_reply,
+                                const char *secret) {
+  if (preview_token_valid(msg, issue_id, secret)) {
+    return 1;
+  }
+
+  int user_logged = 0;
+  is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
+  return user_logged;
+}
+
+/** @brief Appends the caching policy for an issue response. */
+static void set_issue_cache(int cacheable) {
+  size_t len = strlen(g_json_header);
+  snprintf(g_json_header + len, sizeof(g_json_header) - len, "%s",
+           cacheable ? "Cache-Control: public, max-age=120, "
+                       "stale-while-revalidate=60\r\n"
+                     : "Cache-Control: no-store\r\n");
+}
 
 struct newsletter_ctx {
   char **emails;
@@ -75,6 +148,15 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
         return;
       }
     }
+
+    // Drafts and archives are for authors only: without a session the status
+    // filter is forced, whatever the caller asked for.
+    int user_logged = 0;
+    is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
+    if (user_logged == 0) {
+      status = "PUBLISHED";
+    }
+    set_issue_cache(user_logged == 0);
 
     printf("QUERY PARAMS:\tQUERY - %.*s\t|\tSORT - %.*s\t|\tSTATUS - %s\n",
            (int)q.len, q.buf, (int)sort.len, sort.buf, status ? status : "");
@@ -161,18 +243,28 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
   } else if (mg_match(msg->method, mg_str("POST"), NULL)) {
     // Check if user logged
     int user_logged = 0;
-    is_user_logged(c, msg, error_reply, secret, &user_logged);
+    struct user *current_user = malloc(sizeof(struct user));
+    if (user_init(current_user) != 0) {
+      free(current_user);
+      ERROR_REPLY_500;
+      fprintf(stderr, TERMINAL_ERROR_MESSAGE("USER IS NULL"));
+      return;
+    }
+    is_user_logged(c, msg, error_reply, secret, &user_logged, current_user);
 
     if (user_logged == 0) {
+      free_user(current_user);
       ERROR_REPLY_401;
       fprintf(stderr, TERMINAL_ERROR_MESSAGE(UNAUTHORIZED_MESSAGE));
       return;
     }
 
     if (msg->body.len <= 0) {
+      free_user(current_user);
       ERROR_REPLY_400(BODY_REQUIRED_MESSAGE);
       return;
     } else if (!mg_validateJSON(msg->body)) {
+      free_user(current_user);
       ERROR_REPLY_400(JSON_ERROR_MESSAGE);
       return;
     }
@@ -187,7 +279,8 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
 
     // Title required
     offset = mg_json_get(msg->body, "$.title", &length);
-    if (offset < 0) {
+    if (offset < 0 || length - 2 <= 0) {
+      free_user(current_user);
       ERROR_REPLY_400(TITLE_REQUIRED_MESSAGE);
       return;
     } else {
@@ -197,17 +290,20 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
     // Issue number required
     offset = mg_json_get(msg->body, "$.issueNumber", &length);
     if (offset < 0) {
+      free_user(current_user);
       ERROR_REPLY_400(ISSUE_NUMBER_REQUIRED_MESSAGE);
       free(title);
       return;
     } else {
       // Issue number not existing already
       char *issue_number_str = malloc(length + 1);
-      snprintf(issue_number_str, length + 1, STR_FMT, length, msg->body.buf + offset);
+      snprintf(issue_number_str, length + 1, STR_FMT, length,
+               msg->body.buf + offset);
 
       issue_number = atoi(issue_number_str);
       free(issue_number_str);
       if (issue_number <= 0) {
+        free_user(current_user);
         ERROR_REPLY_400(ISSUE_NUMBER_REQUIRED_MESSAGE);
         free(title);
         return;
@@ -215,19 +311,21 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
     }
 
     offset = mg_json_get(msg->body, "$.slug", &length);
-    if (offset > 0) {
+    if (offset < 0 || length <= 2) {
+      free_user(current_user);
+      ERROR_REPLY_400(SLUG_REQUIRED_MESSAGE);
+      return;
+    } else {
       slug = malloc(length);
       strncpy(slug, msg->body.buf + offset + 1, length - 2);
       slug[length - 2] = '\0';
-    } else {
-      slug = strdup(title);
-      str_to_slug(slug, strlen(slug));
     }
 
-    int exists = issue_identity_exists(title, issue_number, slug);
+    int exists = issue_identity_exists(title, issue_number, slug, 0);
     free(title);
     free(slug);
     if (exists != 0) {
+      free_user(current_user);
       ERROR_REPLY_400(ISSUE_EXISTS_MESSAGE);
       return;
     };
@@ -236,6 +334,7 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
     offset = mg_json_get(msg->body, "$.status", &length);
     char status[12];
     if (length > 12) {
+      free_user(current_user);
       ERROR_REPLY_400(STATUS_FORMAT_MESSAGE);
 
       return;
@@ -246,6 +345,7 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
 
       if (strcmp(status, "DRAFT") != 0 && strcmp(status, "PUBLISHED") != 0 &&
           strcmp(status, "ARCHIVE") != 0) {
+        free_user(current_user);
         ERROR_REPLY_400(STATUS_FORMAT_MESSAGE);
 
         return;
@@ -256,6 +356,7 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
     struct issue *issue = malloc(sizeof(struct issue));
     int issue_init_rc = issue_init(issue);
     if (issue_init_rc != 0) {
+      free_user(current_user);
       ERROR_REPLY_500;
       fprintf(stderr, TERMINAL_ERROR_MESSAGE("ISSUE IS NULL"));
 
@@ -272,15 +373,26 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
     // Store in DB
     query_code = add_issue(issue);
     if (query_code != 0) {
+      free_user(current_user);
       fprintf(stderr, TERMINAL_ERROR_MESSAGE("ERROR RETRIEVING ISSUES"));
       HANDLE_QUERY_CODE;
       free_issue(issue);
       return;
     }
 
+    // Author the issue with the logged-in user
+    struct issue_author issue_author = {.user_id = current_user->id,
+                                        .issue_id = issue->id};
+    query_code = add_issue_author(&issue_author);
+    if (query_code != 0) {
+      fprintf(stderr,
+              TERMINAL_ERROR_MESSAGE("ERROR ADDING ISSUE AUTHOR"));
+    }
+
     struct issue *created = malloc(sizeof(struct issue));
     query_code = get_issue(created, issue->id);
     if (query_code != 0) {
+      free_user(current_user);
       fprintf(stderr, TERMINAL_ERROR_MESSAGE("ERROR RETRIEVING ISSUES"));
       HANDLE_QUERY_CODE;
       free_issue(issue);
@@ -293,6 +405,7 @@ void send_issues_res(struct mg_connection *c, struct mg_http_message *msg,
     free(result);
     printf(TERMINAL_SUCCESS_MESSAGE("=== ISSUE SUCCESSFULLY ADDED ==="));
 
+    free_user(current_user);
     free_issue(created);
     free_issue(issue);
   } else {
@@ -328,19 +441,31 @@ void send_issue_res(struct mg_connection *c, struct mg_http_message *msg,
       HANDLE_QUERY_CODE;
 
       return;
-    } else {
-      char *result = issue_to_json(issue);
-
-      SUCCESS_REPLY_200(result);
-      free(result);
-      printf(TERMINAL_SUCCESS_MESSAGE("=== ISSUE SUCCESSFULLY SENT ==="));
     }
+
+    // Same rule as the by-slug route: no enumerating drafts by id.
+    int published =
+        issue->status != NULL && strcmp(issue->status, "PUBLISHED") == 0;
+    if (!published && !may_read_unpublished(c, msg, id, error_reply, secret)) {
+      ERROR_REPLY_404;
+      fprintf(stderr, TERMINAL_ERROR_MESSAGE("ISSUE NOT PUBLISHED"));
+      free_issue(issue);
+      return;
+    }
+    set_issue_cache(published &&
+                    mg_http_var(msg->query, mg_str("preview")).len == 0);
+
+    char *result = issue_to_json(issue);
+
+    SUCCESS_REPLY_200(result);
+    free(result);
+    printf(TERMINAL_SUCCESS_MESSAGE("=== ISSUE SUCCESSFULLY SENT ==="));
 
     free_issue(issue);
   } else if (mg_match(msg->method, mg_str("PUT"), NULL)) {
     // Check if user logged
     int user_logged = 0;
-    is_user_logged(c, msg, error_reply, secret, &user_logged);
+    is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
 
     if (user_logged == 0) {
       ERROR_REPLY_401;
@@ -377,9 +502,10 @@ void send_issue_res(struct mg_connection *c, struct mg_http_message *msg,
     if (offset >= 0) {
       // Issue number not existing already
       char *issue_number_str = malloc(length + 1);
-      mg_http_get_var(&msg->body, "issueNumber", issue_number_str, length + 1);
+      snprintf(issue_number_str, length + 1, STR_FMT, length,
+               msg->body.buf + offset);
 
-      int issue_number = atoi(issue_number_str);
+      issue_number = atoi(issue_number_str);
       free(issue_number_str);
       if (issue_number <= 0) {
         ERROR_REPLY_400(ISSUE_NUMBER_REQUIRED_MESSAGE);
@@ -396,7 +522,7 @@ void send_issue_res(struct mg_connection *c, struct mg_http_message *msg,
     }
 
     if (title != NULL || issue_number > 0 || slug != NULL) {
-      int exists = issue_identity_exists(title, issue_number, slug);
+      int exists = issue_identity_exists(title, issue_number, slug, id);
       if (exists != 0) {
         ERROR_REPLY_400(ISSUE_EXISTS_MESSAGE);
         free(title);
@@ -445,6 +571,10 @@ void send_issue_res(struct mg_connection *c, struct mg_http_message *msg,
       return;
     }
 
+    // Remembered before hydration: issue_hydrate() overwrites cover->id in
+    // place, so this is the only chance to know which media is being dropped.
+    int previous_cover_id = issue->cover != NULL ? issue->cover->id : 0;
+
     issue_hydrate(msg, issue);
     if (slug != NULL) {
       issue->slug = slug;
@@ -457,6 +587,17 @@ void send_issue_res(struct mg_connection *c, struct mg_http_message *msg,
       HANDLE_QUERY_CODE;
 
       return;
+    }
+
+    // The cover was replaced: drop the previous image so it does not linger
+    // in the database and in Blob storage forever. The issue is already
+    // saved, so a failure here is logged, never fatal.
+    int new_cover_id = issue->cover != NULL ? issue->cover->id : 0;
+    if (previous_cover_id > 0 && previous_cover_id != new_cover_id) {
+      if (delete_media_with_blob(previous_cover_id) != 0) {
+        fprintf(stderr,
+                TERMINAL_ERROR_MESSAGE("COULD NOT DELETE REPLACED COVER"));
+      }
     }
 
     query_code = get_issue(issue, id);
@@ -476,7 +617,7 @@ void send_issue_res(struct mg_connection *c, struct mg_http_message *msg,
   } else if (mg_match(msg->method, mg_str("DELETE"), NULL)) {
     // Check if user logged
     int user_logged = 0;
-    is_user_logged(c, msg, error_reply, secret, &user_logged);
+    is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
 
     if (user_logged == 0) {
       ERROR_REPLY_401;
@@ -497,6 +638,120 @@ void send_issue_res(struct mg_connection *c, struct mg_http_message *msg,
   }
 }
 
+void send_issue_by_slug_res(struct mg_connection *c,
+                            struct mg_http_message *msg, char *slug,
+                            struct error_reply *error_reply,
+                            const char *secret) {
+  int query_code;
+  struct error_reply _er = {0};
+  error_reply = &_er;
+
+  if (!mg_match(msg->method, mg_str("GET"), NULL)) {
+    ERROR_REPLY_405;
+    return;
+  }
+
+  printf(TERMINAL_ENDPOINT_MESSAGE("=== GET ISSUE BY SLUG ==="));
+
+  // Check if exists
+  int exists = issue_slug_exists(slug);
+  if (!exists) {
+    ERROR_REPLY_404;
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("ISSUE NOT FOUND"));
+    return;
+  }
+
+  struct issue *issue = malloc(sizeof(struct issue));
+
+  query_code = get_issue_by_slug(issue, slug);
+
+  if (query_code != 0) {
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("ERROR RETRIEVING ISSUE"));
+    HANDLE_QUERY_CODE;
+
+    free(issue);
+    return;
+  }
+
+  // An unpublished issue stays invisible without a preview token or a session.
+  // 404 rather than 401: the existence of a draft is itself private.
+  int published = issue->status != NULL && strcmp(issue->status, "PUBLISHED") == 0;
+  if (!published &&
+      !may_read_unpublished(c, msg, issue->id, error_reply, secret)) {
+    ERROR_REPLY_404;
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("ISSUE NOT PUBLISHED"));
+    free_issue(issue);
+    return;
+  }
+  set_issue_cache(published && mg_http_var(msg->query, mg_str("preview")).len == 0);
+
+  char *result = issue_to_json(issue);
+
+  SUCCESS_REPLY_200(result);
+  free(result);
+  printf(TERMINAL_SUCCESS_MESSAGE("=== ISSUE SUCCESSFULLY SENT ==="));
+
+  free_issue(issue);
+}
+
+void preview_issue_res(struct mg_connection *c, struct mg_http_message *msg,
+                       int id, struct error_reply *error_reply,
+                       const char *secret) {
+  struct error_reply _er = {0};
+  error_reply = &_er;
+
+  if (!mg_match(msg->method, mg_str("POST"), NULL)) {
+    ERROR_REPLY_405;
+    return;
+  }
+
+  printf(TERMINAL_ENDPOINT_MESSAGE("=== CREATE ISSUE PREVIEW TOKEN ==="));
+
+  int user_logged = 0;
+  is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
+  if (user_logged == 0) {
+    ERROR_REPLY_401;
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE(UNAUTHORIZED_MESSAGE));
+    return;
+  }
+
+  int exists = issue_exists(id);
+  if (!exists) {
+    ERROR_REPLY_404;
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("ISSUE NOT FOUND"));
+    return;
+  }
+
+  long expires_at = time(NULL) + PREVIEW_TOKEN_TTL;
+
+  jwt_t *jwt = NULL;
+  jwt_new(&jwt);
+  jwt_add_grant_int(jwt, "issueId", id);
+  jwt_add_grant_int(jwt, "type", PREVIEW);
+  jwt_add_grant_int(jwt, "exp", expires_at);
+  jwt_set_alg(jwt, JWT_ALG_HS256, (unsigned char *)secret, strlen(secret));
+
+  char *jwt_str = jwt_encode_str(jwt);
+  jwt_free(jwt);
+
+  if (jwt_str == NULL) {
+    ERROR_REPLY_500;
+    fprintf(stderr, TERMINAL_ERROR_MESSAGE("ERROR ENCODING PREVIEW TOKEN"));
+    return;
+  }
+
+  cJSON *obj = cJSON_CreateObject();
+  cJSON_AddStringToObject(obj, "token", jwt_str);
+  cJSON_AddNumberToObject(obj, "expiresAt", (double)expires_at);
+  char *result = cJSON_PrintUnformatted(obj);
+  cJSON_Delete(obj);
+  free(jwt_str);
+
+  SUCCESS_REPLY_200(result);
+  free(result);
+  printf(TERMINAL_SUCCESS_MESSAGE("=== PREVIEW TOKEN SENT ==="));
+}
+
 void publish_issue_res(struct mg_connection *c, struct mg_http_message *msg,
                        int id, struct error_reply *error_reply,
                        const char *secret) {
@@ -513,7 +768,7 @@ void publish_issue_res(struct mg_connection *c, struct mg_http_message *msg,
 
   // Auth
   int user_logged = 0;
-  is_user_logged(c, msg, error_reply, secret, &user_logged);
+  is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
   if (user_logged == 0) {
     ERROR_REPLY_401;
     fprintf(stderr, TERMINAL_ERROR_MESSAGE(UNAUTHORIZED_MESSAGE));
@@ -566,7 +821,8 @@ void publish_issue_res(struct mg_connection *c, struct mg_http_message *msg,
     ctx->emails = emails;
     ctx->count = subscribers_len;
     const char *app_url = getenv("APP_URL");
-    if (!app_url) app_url = "https://datenow.com";
+    if (!app_url)
+      app_url = "https://datenow.com";
 
     snprintf(ctx->subject, sizeof(ctx->subject), EMAIL_NEWSLETTER_SUBJECT_FMT,
              title);
@@ -590,7 +846,8 @@ void publish_issue_res(struct mg_connection *c, struct mg_http_message *msg,
       pthread_attr_destroy(&attr);
     }
   } else if (emails != NULL) {
-    for (size_t i = 0; i < subscribers_len; i++) free(emails[i]);
+    for (size_t i = 0; i < subscribers_len; i++)
+      free(emails[i]);
     free(emails);
   }
 
@@ -598,4 +855,49 @@ void publish_issue_res(struct mg_connection *c, struct mg_http_message *msg,
 
   SUCCESS_REPLY_200_MSG("Issue published and newsletter sent");
   printf(TERMINAL_SUCCESS_MESSAGE("=== ISSUE SUCCESSFULLY PUBLISHED ==="));
+}
+
+void send_issue_count_res(struct mg_connection *c, struct mg_http_message *msg,
+                          struct error_reply *error_reply, const char *secret) {
+  struct error_reply _er = {0};
+  error_reply = &_er;
+
+  if (!mg_match(msg->method, mg_str("GET"), NULL)) {
+    ERROR_REPLY_405;
+    return;
+  }
+
+  printf(TERMINAL_ENDPOINT_MESSAGE("=== GET ISSUE COUNT ==="));
+
+  int user_logged = 0;
+  is_user_logged(c, msg, error_reply, secret, &user_logged, NULL);
+  if (user_logged == 0) {
+    ERROR_REPLY_401;
+    return;
+  }
+
+  char status_buf[16] = "";
+  const char *status = NULL;
+  int status_len =
+      mg_http_get_var(&msg->query, "status", status_buf, sizeof(status_buf));
+  if (status_len > 0) {
+    if (strcmp(status_buf, "DRAFT") == 0 ||
+        strcmp(status_buf, "PUBLISHED") == 0 ||
+        strcmp(status_buf, "ARCHIVE") == 0) {
+      status = status_buf;
+    } else {
+      ERROR_REPLY_400(STATUS_FORMAT_MESSAGE);
+      return;
+    }
+  }
+
+  int count = get_issues_count(status);
+  if (count < 0) {
+    ERROR_REPLY_500;
+    return;
+  }
+
+  char json[32];
+  snprintf(json, sizeof(json), "{\"count\":%d}", count);
+  SUCCESS_REPLY_200(json);
 }

@@ -3,7 +3,7 @@ FROM alpine:3.23.4 AS base
 RUN apk update && apk add --no-cache \
     libjwt2 \
     openssl \
-    sqlite-libs \
+    libpq \
     curl \
     imagemagick \
     libwebp \
@@ -15,36 +15,36 @@ RUN apk add --no-cache \
     alpine-sdk \
     libjwt2-dev \
     openssl-dev \
-    sqlite-dev \
+    postgresql-dev \
     curl-dev \
     imagemagick-dev \
     cjson-dev \
     pkgconfig \
     bear \
+    gdb \
     nodejs \
     npm
 
 WORKDIR /app
 
-RUN mkdir -p bin obj/lib obj/endpoints obj/sql /var/www/uploads/media
+RUN mkdir -p bin obj/lib obj/endpoints obj/sql
 
 COPY . .
 
-RUN npx tabula-docs@0.1.4 validate docs/api.json
+RUN npx tabula-docs@0.1.6 validate docs/api.json
 
 RUN bear -- make
 
 EXPOSE 8000
 
-CMD ["./bin/serv_api"]
+# CMD ["./bin/serv_api"]
+CMD ["tail", "-f", "/dev/null"]
 
 FROM base AS run
 
 RUN rm -rf /sbin/apk /etc/apk /lib/apk /usr/share/apk /var/lib/apk
 
 WORKDIR /app
-
-RUN mkdir -p /var/www/uploads/media
 
 COPY --from=dev /app/bin /app/bin
 COPY index.html .

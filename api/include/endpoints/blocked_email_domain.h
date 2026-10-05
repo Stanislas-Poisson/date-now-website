@@ -2,20 +2,21 @@
 
 /**
  * @file endpoints/blocked_email_domain.h
- * @brief Blocked email domain collection and single-resource endpoint handlers.
+ * @brief Blocklist of disposable email domains: endpoint handlers.
  */
 
 #include <lib/mongoose.h>
 #include <structs.h>
 
 /**
- * @brief Handles GET/POST /blocked-domain — list domains or add a new one.
+ * @brief Handles GET/POST /blocked-domain — list the blocked domains or block
+ *        a new one.
  *
- * GET: returns the list of blocked domains. Visibility is controlled by
- *      the BLOCKED_DOMAIN_LIST_PUBLIC env var ("1" = public, otherwise
- *      AUTHOR authentication is required).
- * POST: adds a new domain to the blocklist. Requires AUTHOR authentication.
- *       Body: {"domain": "example.com"}
+ * GET: returns a plain JSON array of domains. It needs an authenticated author,
+ *      unless the environment variable BLOCKED_DOMAIN_LIST_PUBLIC is "1".
+ * POST: body {"domain": "mailinator.com"}. The domain is cleaned (lowercase, no
+ *       trailing dot) before it is stored. Requires an author (201, or 409 when
+ *       the domain is already blocked).
  *
  * @param c           Active Mongoose connection.
  * @param msg         Parsed HTTP message.
@@ -28,13 +29,14 @@ void send_blocked_email_domains_res(struct mg_connection *c,
                                     const char *secret);
 
 /**
- * @brief Handles DELETE /blocked-domain/:domain — remove a blocked domain.
+ * @brief Handles DELETE /blocked-domain/:domain — unblock a domain.
  *
- * Requires AUTHOR authentication.
+ * Requires an authenticated author. The domain is cleaned before the lookup, so
+ * "Example.COM" removes "example.com".
  *
  * @param c           Active Mongoose connection.
  * @param msg         Parsed HTTP message.
- * @param domain      URL-decoded domain string (not freed by this function).
+ * @param domain      Domain from the URL (not freed).
  * @param error_reply Pre-allocated error reply structure.
  * @param secret      JWT signing secret (not freed).
  */

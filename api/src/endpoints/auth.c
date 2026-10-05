@@ -213,6 +213,7 @@ void send_subscription_mail(struct mg_connection *c,
              app_url, jwt_str);
     int mail_sent = send_mail(email, EMAIL_SUBSCRIPTION_SUBJECT, html);
 
+    free(jwt_str);
     free(email);
     if (mail_sent != 0) {
       ERROR_REPLY_400(EMAIL_ERROR_MESSAGE);

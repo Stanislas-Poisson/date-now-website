@@ -35,7 +35,12 @@
 
 char g_json_header[JSON_HEADER_SIZE];
 
-static void clean_db(void) { PQfinish(db); }
+/* Called by the signal handler and again by exit() (atexit): the connection
+ * is closed once, PQfinish(NULL) does nothing the second time. */
+static void clean_db(void) {
+  PQfinish(db);
+  db = NULL;
+}
 
 static void handle_shutdown(int code) {
   printf(">>> signal %d received — shutting down\n", code);
